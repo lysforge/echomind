@@ -2,9 +2,9 @@
 
 # EchoMind
 
-**Self-Hosted Family Smart Speaker, Multi-Stage Audio Library & Voiceprint Memory Hub**
+**Self-Hosted Family Cloud Music, Podcast & Smart Speaker Hub**
 
-Bring music, picture books, graded English courses, RSS podcasts, multi-room speaker queues, and voiceprint-isolated family memories into one clean, private self-hosted space.
+Stream music endlessly, batch-download playlists and charts directly into your server library, follow RSS podcasts, cast across multi-room speakers, and optionally unlock kid-safe picture books, graded English courses, and voiceprint memory isolation.
 
 [简体中文](README.md) · [Key Features](#key-features) · [Quick Start](#quick-start) · [Architecture](#architecture) · [Hardware Integration](#smart-speaker--hardware-integration) · [Contributing](CONTRIBUTING.md)
 
@@ -13,62 +13,54 @@ Bring music, picture books, graded English courses, RSS podcasts, multi-room spe
 
 </div>
 
-EchoMind is a lightweight, self-hosted audio and smart speaker control hub designed for households with members of all ages. Built on a single cohesive stack (FastAPI + SQLite + React), it runs directly on a home NAS, Mac mini, or Linux server without requiring external smart-home platforms.
+EchoMind is built for whole-household self-hosting on a home NAS or cloud VPS:
+- **Core Everyday Experience**: Search across major music platforms, browse live charts, batch-download complete playlists or albums directly onto your server (with LRC lyrics and `-16 LUFS` loudness normalization), subscribe to RSS podcasts, and play via browser or smart speakers across rooms.
+- **Thoughtful Family Extensions**: When you add child members with birth year/month, EchoMind dynamically activates age-appropriate storybooks, structured graded English series, per-speaker max-volume protection, and voiceprint-isolated memories.
 
-EchoMind follows a **zero fake-data policy**: fresh installations start cleanly with zero pre-fabricated devices, members, or mock logs. The first registered account automatically becomes the platform administrator, with role-based access control (RBAC) for additional family accounts and four switchable UI themes (Warm Radio, Minimal Indigo, Clear Sky, and Deep Vinyl).
+EchoMind starts with **zero fabricated data** — empty devices, members, and memories by default. The first registered user becomes the admin, and all users can switch seamlessly across four modern UI themes (Warm Radio, Minimal Indigo, Clear Sky, Deep Vinyl).
 
 ---
 
 ## Key Features
 
-EchoMind separates daily listening from backend administration with two distinct workspaces: a distraction-free **Family Listening Console** and an admin-only **Content Studio & System Console**.
+EchoMind keeps daily listening distraction-free by separating the **Family Listening Console** from the admin-only **Content Studio**.
 
 ### 1. Family Listening Console
 
 | Space | Capabilities |
 | --- | --- |
-| **Discover & Albums** | Unifies music, picture books, graded English series, and podcasts into a consistent **Album → Track** model with 4 channels and customizable sub-tags, age-aware ranking per family member, resume-from-last-track, browser playback, and instant online audio search & play. |
-| **Rooms & Sleep Timers** | Sonos/Connect-style multi-room playback: push full album queues to multiple connected speakers at once, control sequential / repeat-one / shuffle playback, set sleep timers by duration or remaining episodes, and schedule daily automated playback routines. |
-| **Family & Voiceprints** | Tracks growth dynamically via birth month/year (`0-3`, `3-6`, `6-9`, `9-12`, `12-18`, and `All-Age`) alongside English proficiency stages (`Pre-A1` through `B2+`); supports in-browser voiceprint enrollment and three-tier memory isolation (`family`, `personal`, `growth`). |
-| **Voice Control Drawer** | Send natural-language voice or text commands (play specific episodes, next/previous track, adjust volume, pause/resume, or stop after N minutes/episodes) via microphone recording or text input. |
+| **Cloud Music & Batch Download** | Powered by a companion `go-music-dl` engine via Docker Compose: aggregate search across NetEase, QQ Music, Kugou, Kuwo, Migu, Bilibili, and more; browse live toplists; resolve full playlists/albums; stream with automatic fallback source switching; and batch-download tracks directly into persistent server albums with LRC lyrics. |
+| **Private Library & Podcasts** | Unified **Album → Track** organization across music playlists, RSS podcasts, picture books, and graded English courses, featuring custom sub-tags, age-aware member sorting, progress resume, and one-click speaker casting. |
+| **Multi-Room Speakers & Timers** | Sonos/Connect-style server-managed queues pushing entire albums to multiple rooms simultaneously, loop modes, sleep timers (by minutes or episode count), and daily cron schedules. |
+| **Family & Voiceprints** | Dynamic age-stage & English-stage tracking, in-browser voiceprint enrollment, and three-tier memory isolation (`family`, `personal`, `growth`) with fail-safe fallback to `child_safe` mode. |
+| **Voice Control Drawer** | Natural-language playback commands (play tracks/episodes, next/previous, adjust volume clamped to `max_volume`, pause/resume, sleep timers) via voice or text. |
 
 ### 2. Admin Content Studio & System Settings
 
-| Space | Capabilities |
-| --- | --- |
-| **Catalog & Taxonomy** | Manage channel sub-tags, edit album metadata (age stage, English stage, language, playback mode), reorder tracks, and inspect accompanying story scripts or vocabulary cards. |
-| **Five Content Pipelines** | 1. **Voice Cache Inbox** (review auto-cached online tracks and promote them into curated albums); 2. **Local Folder Scanner** (index `.mp3/.m4a/.wav/.flac/.ogg/.opus/.aac` and paired `.txt` scripts); 3. **Upload & URL Fetch** (upload files or collect media via `yt-dlp`); 4. **Podcast RSS Subscriptions** (preview feeds and run incremental deduplicated syncs); 5. **Text-to-Audio & AI Course Builder** (synthesize read-aloud tracks or generate 4-lesson themed English series). |
-| **Hardware, Users & System** | Pre-provision speakers or claim newly discovered hardware via 6-digit pairing codes, export pre-filled bridge scripts, enforce per-speaker hearing-protection max volume (`max_volume`) and quiet hours, configure LLM/ASR/voiceprint endpoints, and manage family user accounts. |
-
----
-
-## Core Engineering Highlights
-
-- **Local-First → Instant Live Stream + Background Auto-Cache**: Voice playback checks the local library first; on cache miss, EchoMind streams audio immediately via FFmpeg transcoding while saving and normalizing a local copy into the Voice Cache Inbox in the background (with age-appropriate local story fallback when offline).
-- **On-Demand Synthesis & `-16 LUFS` Loudness Normalization**: Text-backed stories and English lesson scripts synthesize audio cleanly on first playback and pass through FFmpeg `loudnorm` targeting `-16 LUFS` so playback volume stays consistent and ear-safe across sources.
-- **Server-Side Room Queues & Voice State Machine**: Connected hardware reports natural completion (`track_ended`) over WebSocket to advance queues automatically and honor episode-based or timed sleep stops. Voice volume commands are strictly clamped by each device's `max_volume`.
-- **Fail-Safe Voiceprint Privacy**: Built-in 64-bin mel envelope + pitch F0 speaker matching (or optional external `3D-Speaker` service). Unrecognized voices or low-confidence matches automatically fall back to `child_safe` mode and never expose private adult memories.
+- **Catalog & Sub-Tag Management**: Customize channel sub-tags and track/lyric metadata.
+- **Five Content Ingest Pipelines**: Voice Cache Inbox (promote auto-cached online plays into curated albums), Local Folder Scanner, Upload & URL Fetch (`yt-dlp`), Podcast RSS Subscriptions, and Text-to-Audio / AI English Course Builder.
+- **Hardware, Users & Settings**: Configure companion `go-music-dl` URL & sources, LLM providers (DeepSeek / OpenAI-compatible / Ollama), TTS voices, hearing-protection max volume, quiet hours, 6-digit speaker pairing codes, and multi-user RBAC.
 
 ---
 
 ## Architecture
 
+EchoMind stays cleanly licensed under **MIT** and runs as a single self-contained stack (FastAPI + SQLite + React), communicating over internal HTTP with an optional `go-music-dl` container orchestrated via `docker-compose.yml`. When the companion music engine is not running, all core library, podcast, speaker queue, and built-in fallback search features continue operating independently.
+
 ```mermaid
 flowchart LR
-  Web["React Console<br/>(Family / Content Studio)"] -- "REST + WebSocket (/ws/web)" --> Server
-  Speaker["Speaker Bridge Client<br/>(clients/echomind_xiaoai_agent.py)"] -- "Playback Commands + track_ended (/ws/speaker)" --> Server
-  ESP32["ESP32 Voice Hardware<br/>(/xiaozhi/ota/ & /xiaozhi/v1/)"] -- "60ms Opus Frames" --> Server
+  Web["React Console<br/>(Cloud Music · Library · Room Queues)"] -- "REST + /ws/web" --> Core
+  Speaker["Speaker Bridge / ESP32<br/>(/ws/speaker · /xiaozhi/v1/)"] -- "Queue Commands + track_ended + Opus" --> Core
 
-  subgraph Server["EchoMind Backend (FastAPI)"]
-    Brain["Voice Brain<br/>(Voiceprint · Playback State Machine · LLM)"]
-    Queue["Multi-Room Queue & Scheduler<br/>(playback_sessions · APScheduler)"]
-    Ingest["Ingest Pipelines & Audio Engine<br/>(yt-dlp · RSS · FFmpeg -16 LUFS · TTS)"]
-    DB[("SQLite + Local Media Store")]
+  subgraph Core["EchoMind Core (FastAPI · MIT)"]
+    Brain["Voice State Machine & Voiceprints"]
+    Queue["Multi-Room Queue & Scheduler"]
+    CloudMgr["Batch Downloader & FFmpeg -16 LUFS"]
+    DB[("SQLite + ./data Media Store")]
   end
 
-  Brain --> Queue
-  Brain --> Ingest
-  Ingest --> DB
+  Core <-- "Internal HTTP (Search · Charts · Playlists · Stream · LRC)" --> GMD["go-music-dl Container<br/>(Multi-Platform Music Sources)"]
+  CloudMgr --> DB
   Queue --> DB
 ```
 
@@ -76,9 +68,9 @@ flowchart LR
 
 ## Quick Start
 
-### Option 1: Docker Compose (Recommended for NAS / Linux)
+### Option 1: Docker Compose (Recommended for Cloud VPS / NAS)
 
-Requires Docker Engine / Docker Compose:
+Starts both **EchoMind (`:8090`)** and the **companion multi-source music engine**:
 
 ```bash
 git clone https://github.com/lysforge/echomind.git
@@ -86,11 +78,13 @@ cd echomind
 docker compose up -d --build
 ```
 
-The service listens on `http://localhost:8090`, storing SQLite state and media files in `./data`. Uncomment the extra volume mount in `docker-compose.yml` to scan an existing host audio directory.
+1. Open **`http://<your-server-ip>:8090`** in your browser and register the first user (automatically granted admin privileges).
+2. All SQLite state, downloaded audio, and lyrics persist in `./data`.
+3. The companion engine binds strictly to `127.0.0.1:18080` on the host; use SSH port forwarding if you wish to configure optional platform cookies locally without exposing the downloader port publicly.
 
 ### Option 2: Run Natively (macOS / Linux)
 
-Prerequisites: `Node.js 20+`, `Python 3.11–3.13`, and `ffmpeg` (`brew install ffmpeg` on macOS or `sudo apt install ffmpeg` on Ubuntu/Debian).
+Requires `Node.js 20+`, `Python 3.11–3.13`, and `ffmpeg`:
 
 ```bash
 git clone https://github.com/lysforge/echomind.git
@@ -99,32 +93,24 @@ chmod +x start.sh
 ./start.sh
 ```
 
-`start.sh` builds the frontend bundle, initializes the Python virtual environment, and launches Uvicorn on `0.0.0.0:8090` (override with `PORT=9000 ./start.sh`).
+Optionally launch the companion container locally alongside `./start.sh`:
 
-### Initial Setup
-
-1. Open **`http://localhost:8090`** in your browser.
-2. Register the first user — **this account automatically receives administrator privileges**.
-3. Complete the onboarding wizard to configure home/assistant names, optional LLM credentials (DeepSeek, OpenAI-compatible APIs, or Ollama — works offline without a key via local intent routing), your first family member, and your first speaker.
+```bash
+docker run -d --name echomind-music-dl -p 127.0.0.1:18080:8080 guohuiyuan/go-music-dl:latest ./music-dl web --port 8080 --no-browser
+```
 
 ---
 
 ## Smart Speaker & Hardware Integration
 
-- **Speaker Bridge Client**: Creating a speaker in **Hardware, Users & System** provides an `auth_token` and a downloadable pre-configured script based on `clients/echomind_xiaoai_agent.py` to connect speakers or Raspberry Pi / PC audio endpoints over `/ws/speaker`.
-- **Zero-Config Discovery**: Unregistered devices connecting to `/ws/speaker` receive a 6-digit `pair_code` and appear in the pending claim pool for instant one-click approval.
-- **ESP32 Voice Hardware Compatibility**: Exposes `/xiaozhi/ota/` and `/xiaozhi/v1/` WebSocket endpoints with 60ms Opus frame streaming and motion safety bounds.
+- **Bridge Script (`clients/echomind_xiaoai_agent.py`)**: Download pre-filled bridge scripts after creating a speaker in **Hardware, Users & System** to receive full album queues and auto-advance via `track_ended`.
+- **6-Digit Pairing Discovery**: Unregistered speakers connecting to `/ws/speaker` enter a pending claim pool with a 6-digit pairing code.
+- **ESP32 Voice Hardware**: Full `/xiaozhi/ota/` and `/xiaozhi/v1/` Opus frame WebSocket support.
 
 ---
 
 ## Privacy & Responsible Use
 
-- Credentials, family memories, voiceprint embeddings, playback progress, and cached media stay stored locally inside `./data`. Prompts or audio snippets are sent externally only when you explicitly configure cloud LLM or ASR API providers.
-- Keep EchoMind on your trusted LAN or behind an authenticated reverse proxy; avoid exposing unauthenticated setup or admin ports directly to the public internet.
-- Ensure podcast feeds and downloaded URLs comply with your local copyright laws and source terms of service.
-
----
-
-## License
-
-Released under the [MIT License](LICENSE).
+- EchoMind does not bundle copyrighted media. The optional companion music container runs in a separate process under its own license; users are responsible for complying with local copyright laws and source terms of service.
+- All credentials, libraries, voiceprint vectors, and lyrics remain stored locally in `./data`.
+- Licensed under the [MIT License](LICENSE).

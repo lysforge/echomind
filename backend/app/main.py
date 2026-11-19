@@ -21,6 +21,7 @@ from app.routers import (
     english,
     media,
     members,
+    music_cloud,
     playback,
     schedules,
     settings_api,
@@ -62,6 +63,7 @@ app.include_router(sources.router)
 app.include_router(members.router)
 app.include_router(english.router)
 app.include_router(media.router)
+app.include_router(music_cloud.router)
 app.include_router(playback.router)
 app.include_router(schedules.router)
 app.include_router(settings_api.router)

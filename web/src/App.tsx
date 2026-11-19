@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   Compass,
+  Disc3,
   FolderInput,
   Library,
   LogOut,
@@ -21,6 +22,7 @@ import { PlayerBar, QueueItem } from "./components/PlayerBar";
 import { ThemeSwitcher } from "./components/ThemeSwitcher";
 import { VoiceChatDrawer } from "./components/VoiceChatDrawer";
 import { AuthPage } from "./pages/AuthPage";
+import { CloudMusicPage } from "./pages/CloudMusicPage";
 import { ExplorePage } from "./pages/ExplorePage";
 import { FamilyPage } from "./pages/FamilyPage";
 import { OnboardingModal } from "./pages/OnboardingModal";
@@ -30,7 +32,7 @@ import { StudioIngestPage } from "./pages/StudioIngestPage";
 import { StudioSystemPage } from "./pages/StudioSystemPage";
 
 type WorkspaceMode = "front" | "studio";
-type FrontTab = "explore" | "rooms" | "family";
+type FrontTab = "explore" | "cloud" | "rooms" | "family";
 type StudioTab = "catalog" | "ingest" | "system";
 
 export default function App() {
@@ -360,7 +362,8 @@ export default function App() {
     dashboard!.members.length === 0;
 
   const frontNavItems: Array<{ id: FrontTab; label: string; icon: React.ReactNode; badge?: string | number }> = [
-    { id: "explore", label: "发现与专辑库", icon: <Compass className="h-4 w-4" /> },
+    { id: "explore", label: "私有曲库与播客", icon: <Compass className="h-4 w-4" /> },
+    { id: "cloud", label: "无限听歌与下歌", icon: <Disc3 className="h-4 w-4" /> },
     {
       id: "rooms",
       label: "房间音箱与定时",
@@ -383,7 +386,7 @@ export default function App() {
 
   const currentHeaderTitle =
     workspaceMode === "front"
-      ? frontNavItems.find((n) => n.id === frontTab)?.label || "发现与专辑库"
+      ? frontNavItems.find((n) => n.id === frontTab)?.label || "私有曲库与播客"
       : studioNavItems.find((n) => n.id === studioTab)?.label || "管理工作台";
 
   const renderSidebarContent = () => (
@@ -667,7 +670,25 @@ export default function App() {
                       setStudioFocusAlbumId(null);
                     }
                   }}
+                  onOpenCloudMusic={() => setFrontTab("cloud")}
                   onOpenVoiceDrawer={() => setVoiceDrawerOpen(true)}
+                  showToast={showToast}
+                />
+              )}
+              {frontTab === "cloud" && (
+                <CloudMusicPage
+                  albums={dashboard.albums}
+                  onPlayQueue={(items, idx) => void activateItemAt(items, idx)}
+                  onRefreshDashboard={fetchDashboard}
+                  onGoExplore={() => setFrontTab("explore")}
+                  onOpenSettings={
+                    isAdmin
+                      ? () => {
+                          setWorkspaceMode("studio");
+                          setStudioTab("system");
+                        }
+                      : undefined
+                  }
                   showToast={showToast}
                 />
               )}

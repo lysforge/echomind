@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
-import { CheckCircle2, Copy, Cpu, Home, Mic, Moon, Save, Volume2, Wifi, Zap } from "lucide-react";
-import { api, SettingsPayload } from "../api";
+import { CheckCircle2, Copy, Cpu, Disc3, Home, Mic, Moon, Save, Volume2, Wifi, Zap } from "lucide-react";
+import { api, CloudMusicStatus, SettingsPayload } from "../api";
 
 const LLM_PRESETS: Record<"deepseek" | "openai" | "ollama", { url: string; model: string; hint: string }> = {
   deepseek: {
@@ -69,6 +69,10 @@ export function SettingsPage({
   const [quietStart, setQuietStart] = useState("21:30");
   const [quietEnd, setQuietEnd] = useState("07:30");
   const [quietForce, setQuietForce] = useState(false);
+  const [musicDlUrl, setMusicDlUrl] = useState("http://127.0.0.1:18080");
+  const [musicDlSources, setMusicDlSources] = useState("netease,qq,kugou,kuwo,migu,bilibili");
+  const [testingMusicDl, setTestingMusicDl] = useState(false);
+  const [musicDlTestResult, setMusicDlTestResult] = useState<CloudMusicStatus | null>(null);
 
   const loadSettings = async () => {
     setLoading(true);
@@ -94,6 +98,8 @@ export function SettingsPage({
       setQuietStart(res.quiet_hours_start);
       setQuietEnd(res.quiet_hours_end);
       setQuietForce(res.quiet_hours_force_active);
+      setMusicDlUrl(res.music_dl_url || "");
+      setMusicDlSources(res.music_dl_sources || "netease,qq,kugou,kuwo,migu,bilibili");
     } catch (e) {
       showToast((e as Error).message);
     } finally {
@@ -136,6 +142,8 @@ export function SettingsPage({
         quiet_hours_start: quietStart,
         quiet_hours_end: quietEnd,
         quiet_hours_force_active: quietForce,
+        music_dl_url: musicDlUrl.trim(),
+        music_dl_sources: musicDlSources.trim() || "netease,qq,kugou,kuwo,migu,bilibili",
       };
       if (llmApiKey.trim()) payload.llm_api_key = llmApiKey.trim();
       if (asrApiKey.trim()) payload.asr_api_key = asrApiKey.trim();
@@ -150,6 +158,20 @@ export function SettingsPage({
       showToast((e as Error).message);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleTestMusicDl = async () => {
+    setTestingMusicDl(true);
+    setMusicDlTestResult(null);
+    try {
+      const res = await api.testMusicDl(musicDlUrl.trim());
+      setMusicDlTestResult(res);
+      showToast(res.ok ? `多源音乐引擎连通正常 (${res.latency_ms} ms)` : `多源音乐引擎未连通: ${res.error || "请检查地址"}`);
+    } catch (e) {
+      showToast((e as Error).message);
+    } finally {
+      setTestingMusicDl(false);
     }
   };
 
@@ -343,6 +365,64 @@ export function SettingsPage({
             {llmTestResult.reply_preview && (
               <div className="mt-1 text-zinc-700">模型试答：{llmTestResult.reply_preview}</div>
             )}
+          </div>
+        )}
+      </div>
+
+      {/* 2.5 多源云音乐伴生引擎配置 */}
+      <div className="card-pro p-5">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2 border-b border-[var(--border-soft)] pb-3">
+          <div className="flex items-center gap-2">
+            <Disc3 className="h-4 w-4 text-[var(--brand-green)]" />
+            <h3 className="text-sm font-bold">多源无限听歌与云端批量下歌引擎 (go-music-dl)</h3>
+            <span className="rounded-full bg-[var(--brand-green-soft)] px-2 py-0.5 text-[11px] font-semibold text-[var(--brand-green)]">
+              网易云 / QQ / 酷狗 / 酷我 / 咪咕 / B站
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={handleTestMusicDl}
+            disabled={testingMusicDl}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--brand-green)] bg-[var(--brand-green-soft)] px-3.5 py-1.5 text-xs font-semibold text-[var(--brand-green)] hover:bg-[var(--brand-primary-soft-hover)] disabled:opacity-50"
+          >
+            <Zap className="h-3.5 w-3.5" />
+            {testingMusicDl ? "探测中…" : "测试音乐引擎连通"}
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div>
+            <label className="mb-1 block text-xs font-semibold">伴生服务地址 (Docker Compose 内网默认 http://music-dl:8080)</label>
+            <input
+              value={musicDlUrl}
+              onChange={(e) => setMusicDlUrl(e.target.value)}
+              placeholder="http://127.0.0.1:18080 或 http://music-dl:8080"
+              className="w-full rounded-xl border border-[var(--border-soft)] px-3 py-2 font-mono text-xs outline-none focus:border-[var(--brand-green)]"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-semibold">默认聚合搜歌音源（英文逗号分隔）</label>
+            <input
+              value={musicDlSources}
+              onChange={(e) => setMusicDlSources(e.target.value)}
+              placeholder="netease,qq,kugou,kuwo,migu,bilibili"
+              className="w-full rounded-xl border border-[var(--border-soft)] px-3 py-2 font-mono text-xs outline-none focus:border-[var(--brand-green)]"
+            />
+          </div>
+        </div>
+
+        {musicDlTestResult && (
+          <div
+            className={`mt-3 rounded-xl border px-4 py-3 text-xs ${
+              musicDlTestResult.ok ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-rose-200 bg-rose-50 text-rose-900"
+            }`}
+          >
+            <div className="flex items-center gap-2 font-semibold">
+              <CheckCircle2 className="h-4 w-4" />
+              {musicDlTestResult.ok
+                ? `音乐引擎已连通 (${musicDlTestResult.base_url}) · 耗时 ${musicDlTestResult.latency_ms} ms · 可用源: ${musicDlTestResult.sources.join(", ")}`
+                : `音乐引擎未连接 (${musicDlTestResult.base_url}) · ${musicDlTestResult.error || "请先启动 go-music-dl 服务"}`}
+            </div>
           </div>
         )}
       </div>

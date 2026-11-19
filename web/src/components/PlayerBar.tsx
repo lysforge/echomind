@@ -93,9 +93,9 @@ export function PlayerBar({
 
       <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 sm:px-6">
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-bold">{current ? current.title : "EchoMind 护耳播放器"}</div>
+          <div className="truncate text-sm font-bold">{current ? current.title : "EchoMind 云端播放器"}</div>
           <div className="truncate text-xs text-[var(--ink-muted)]">
-            {current ? `${current.subtitle} · -16 LUFS 均衡` : "选择音乐、故事绘本、英语课程即可开始播放"}
+            {current ? `${current.subtitle} · -16 LUFS 均衡` : "畅听私有云曲库、全网热歌与播客电台"}
           </div>
         </div>
 

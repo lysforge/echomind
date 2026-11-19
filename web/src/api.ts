@@ -355,6 +355,8 @@ export interface SettingsPayload {
   quiet_hours_end: string;
   quiet_hours_force_active: boolean;
   loudnorm_target_lufs: number;
+  music_dl_url: string;
+  music_dl_sources: string;
   hardware_endpoints: {
     lan_ip: string;
     port: number;
@@ -362,6 +364,47 @@ export interface SettingsPayload {
     robot_ota_url: string;
     robot_ws_url: string;
   };
+}
+
+export interface CloudSong {
+  id: string;
+  source: string;
+  name: string;
+  artist: string;
+  album: string;
+  cover: string;
+  duration: number;
+  extra: Record<string, unknown>;
+}
+
+export interface CloudCollection {
+  id: string;
+  source: string;
+  title: string;
+  cover: string;
+  creator: string;
+  track_count: number;
+  content_type: "playlist" | "album";
+}
+
+export interface CloudTopList {
+  source: string;
+  toplist_id: string;
+  name: string;
+  update_frequency: string;
+  cover: string;
+  description: string;
+  track_count: number;
+  play_count_text: string;
+}
+
+export interface CloudMusicStatus {
+  ok: boolean;
+  base_url: string;
+  sources: string[];
+  latency_ms: number;
+  error: string;
+  supported_sources: Array<{ id: string; label: string }>;
 }
 
 const TOKEN_KEY = "echomind_auth_token";
@@ -917,4 +960,62 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     }),
+  testMusicDl: (music_dl_url?: string) =>
+    req<CloudMusicStatus>("/api/settings/test-music-dl", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ music_dl_url }),
+    }),
+
+  // Cloud Music (go-music-dl)
+  cloudMusicStatus: () => req<CloudMusicStatus>("/api/cloud-music/status"),
+  cloudMusicSearch: (q: string, searchType: "song" | "playlist" | "album" = "song", sources?: string[], page = 1) => {
+    const qs = new URLSearchParams({ q, search_type: searchType, page: String(page) });
+    if (sources && sources.length > 0) qs.set("sources", sources.join(","));
+    return req<{
+      songs: CloudSong[];
+      collections: CloudCollection[];
+      pagination: { page: number; total_pages: number; total: number };
+    }>(`/api/cloud-music/search?${qs.toString()}`);
+  },
+  cloudMusicToplists: (sources?: string[]) => {
+    const qs = new URLSearchParams();
+    if (sources && sources.length > 0) qs.set("sources", sources.join(","));
+    return req<CloudTopList[]>(`/api/cloud-music/toplists?${qs.toString()}`);
+  },
+  cloudMusicToplistSongs: (source: string, toplistId: string) =>
+    req<CloudSong[]>(
+      `/api/cloud-music/toplists/songs?source=${encodeURIComponent(source)}&toplist_id=${encodeURIComponent(toplistId)}`
+    ),
+  cloudMusicCollectionSongs: (source: string, id: string, kind: "playlist" | "album" = "playlist", page = 1) =>
+    req<CloudSong[]>(
+      `/api/cloud-music/collections/songs?source=${encodeURIComponent(source)}&id=${encodeURIComponent(id)}&kind=${kind}&page=${page}`
+    ),
+  cloudMusicStreamUrl: (song: Pick<CloudSong, "id" | "source" | "name" | "artist" | "album" | "extra">) => {
+    const qs = new URLSearchParams({
+      id: song.id,
+      source: song.source,
+      name: song.name || "",
+      artist: song.artist || "",
+      album: song.album || "",
+      extra: JSON.stringify(song.extra || {}),
+    });
+    return `/api/cloud-music/stream?${qs.toString()}`;
+  },
+  cloudMusicBatchDownload: (payload: {
+    songs: CloudSong[];
+    album_id?: number | null;
+    new_album_title?: string;
+    category?: "music" | "story" | "english" | "podcast";
+    age_stage?: AgeStage;
+  }) =>
+    req<{ job_id: number; album_id: number; album_title: string; total_requested: number; status: string }>(
+      "/api/cloud-music/batch-download",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }
+    ),
+  cloudMusicJobs: (limit = 15) => req<DownloadJob[]>(`/api/cloud-music/jobs?limit=${limit}`),
 };

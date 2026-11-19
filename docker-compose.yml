@@ -4,8 +4,27 @@ services:
     container_name: echomind
     ports:
       - "8090:8090"
+    environment:
+      - TZ=Asia/Shanghai
+      - ECHOMIND_DATA_DIR=/app/data
+      - ECHOMIND_MUSIC_DL_URL=http://music-dl:8080
     volumes:
       - ./data:/app/data
-      # 如需挂载宿主机已有本地音频目录，可取消下一行注释：
+      # 如需扫描宿主机已有本地音频或歌曲目录，可取消下一行注释：
       # - /path/to/your/audio:/mnt/audio:ro
+    depends_on:
+      - music-dl
     restart: unless-stopped
+
+  music-dl:
+    image: guohuiyuan/go-music-dl:latest
+    container_name: echomind-music-dl
+    restart: unless-stopped
+    ports:
+      # 仅监听宿主机回环地址，便于在宿主机浏览器安全配置平台登录 Cookie，不暴露外网
+      - "127.0.0.1:18080:8080"
+    volumes:
+      - ./data/music_dl:/home/appuser/data
+    environment:
+      - TZ=Asia/Shanghai
+    command: ["./music-dl", "web", "--port", "8080", "--no-browser"]

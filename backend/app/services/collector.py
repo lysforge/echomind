@@ -515,10 +515,29 @@ async def _search_ytdlp(prefix: str, q: str, limit: int = 6, timeout_sec: float 
 
 
 async def search_online_audio(query: str, limit: int = 6) -> list[dict[str, Any]]:
-    """高速双引擎在线搜歌/搜故事（中文优先 Bilibili，英文优先 YouTube，自动互备降级）。"""
+    """多源音乐检索（优先复用已连通的 go-music-dl 10+ 源原唱引擎，未启动时平滑回退 Bilibili/YouTube）。"""
     q = query.strip()
     if not q:
         return []
+
+    if os.environ.get("ECHOMIND_DISABLE_MUSIC_DL", "0") != "1" and (load_settings().music_dl_url or "").strip():
+        try:
+            from app.services.music_dl import build_upstream_download_url, cloud_search
+
+            cloud_res = await cloud_search(q=q, search_type="song", timeout_sec=4.0)
+            songs = cloud_res.get("songs") or []
+            if songs:
+                return [
+                    {
+                        "title": f"{s['name']} - {s['artist']}" if s.get("artist") else s["name"],
+                        "duration_sec": int(s.get("duration") or 0),
+                        "uploader": str(s.get("source") or "cloud"),
+                        "url": build_upstream_download_url(s, stream_only=False),
+                    }
+                    for s in songs[:limit]
+                ]
+        except Exception:
+            pass
 
     has_cjk = bool(re.search(r"[\u4e00-\u9fff]", q))
     if has_cjk:
@@ -574,7 +593,10 @@ async def ensure_auto_cache_album(category: str = "music", age_stage: str = "S6_
 
 
 def _looks_like_direct_audio_url(url: str) -> bool:
-    path = urlparse(url).path.lower()
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    if path.endswith("/download") and "source=" in parsed.query and "id=" in parsed.query:
+        return True
     return path.endswith((".mp3", ".m4a", ".wav", ".ogg", ".opus", ".aac", ".flac"))
 
 

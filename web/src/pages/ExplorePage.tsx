@@ -23,10 +23,10 @@ import { QueueItem } from "../components/PlayerBar";
 
 const CHANNELS: Array<{ id: "all" | MediaAlbum["category"]; label: string; emoji: string }> = [
   { id: "all", label: "全部频道", emoji: "✨" },
-  { id: "music", label: "音乐与儿歌", emoji: "🎵" },
+  { id: "music", label: "音乐与歌单", emoji: "🎵" },
+  { id: "podcast", label: "播客与电台", emoji: "🎙️" },
   { id: "story", label: "绘本与故事", emoji: "📖" },
   { id: "english", label: "英语伴学课", emoji: "🎓" },
-  { id: "podcast", label: "科普与播客", emoji: "🎙️" },
 ];
 
 const COVER_THEME: Record<MediaAlbum["category"], string> = {
@@ -52,6 +52,7 @@ export function ExplorePage({
   onPlayUrl,
   onRefreshDashboard,
   onOpenStudioAlbum,
+  onOpenCloudMusic,
   onOpenVoiceDrawer,
   showToast,
 }: {
@@ -63,6 +64,7 @@ export function ExplorePage({
   onPlayUrl: (url: string) => void;
   onRefreshDashboard: () => void;
   onOpenStudioAlbum?: (albumId: number) => void;
+  onOpenCloudMusic?: () => void;
   onOpenVoiceDrawer: () => void;
   showToast: (m: string) => void;
 }) {
@@ -493,23 +495,31 @@ export function ExplorePage({
   // ===================== 一级广场视图（零后台干扰） =====================
   return (
     <div className="space-y-6">
-      {/* 顶部栏：成员适龄视角 + 全网语音/搜歌入口 */}
+      {/* 顶部栏：成员适龄视角 + 无限听歌/全网搜歌入口 */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-xl font-extrabold tracking-tight">家庭声音内容广场</h2>
+          <h2 className="text-xl font-extrabold tracking-tight">私有云曲库与家庭频道</h2>
           <p className="mt-0.5 text-xs text-[var(--ink-muted)]">
             {selectedMember
-              ? `已按「${selectedMember.nickname} · ${selectedMember.age_label || AGE_STAGE_LABELS[selectedMember.age_stage]}」智能置顶适龄音乐、绘本与英语课程`
-              : "集中浏览全家共享的音乐儿歌、绘本故事、分级英语与科普播客，点击专辑即可畅听与推送音箱"}
+              ? `已按「${selectedMember.nickname} · ${selectedMember.age_label || AGE_STAGE_LABELS[selectedMember.age_stage]}」智能置顶最适配的音乐歌单、播客及家庭伴学内容`
+              : "随时畅听服务器自建歌单与订阅播客；亦可切换到伴学频道陪伴孩子听绘本、学英语"}
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {onOpenCloudMusic && (
+            <button
+              onClick={onOpenCloudMusic}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--brand-primary)] px-3.5 py-2 text-xs font-semibold text-white transition hover:bg-[var(--brand-primary-hover)]"
+            >
+              <Disc3 className="h-4 w-4" /> 无限听歌 · 批量下歌入库
+            </button>
+          )}
           <button
             onClick={() => setSearchOpen(true)}
             className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--brand-accent)] bg-[var(--brand-accent-soft)] px-3.5 py-2 text-xs font-semibold text-[var(--brand-accent)] transition hover:opacity-90"
           >
-            <Globe className="h-4 w-4 text-[var(--brand-accent)]" /> 全网点播搜歌 / 故事
+            <Globe className="h-4 w-4 text-[var(--brand-accent)]" /> 快速搜歌点播
           </button>
         </div>
       </div>

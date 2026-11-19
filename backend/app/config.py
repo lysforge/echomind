@@ -97,6 +97,8 @@ class SettingsModel(BaseModel):
 
     loudnorm_target_lufs: float = -16.0
     server_port: int = 8090
+    music_dl_url: str = Field(default_factory=lambda: os.environ.get("ECHOMIND_MUSIC_DL_URL", "http://127.0.0.1:18080"))
+    music_dl_sources: str = "netease,qq,kugou,kuwo,migu,bilibili"
     ffmpeg_bin: str = Field(default_factory=_find_ffmpeg)
     ffprobe_bin: str = Field(default_factory=_find_ffprobe)
     yt_dlp_bin: str = Field(default_factory=_find_yt_dlp)

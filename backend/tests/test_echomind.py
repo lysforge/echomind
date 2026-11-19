@@ -555,3 +555,172 @@ def test_echomind_v3_tags_unified_catalog_room_queue_and_voice_controls():
         finally:
             client.delete(f"/api/devices/{did}", headers=hdr)
 
+
+def test_cloud_music_multi_source_search_toplists_and_batch_download():
+    """验证 go-music-dl 多源搜歌原唱置顶、热歌榜单、歌单解析、实时代理试听与云端批量下歌入库。"""
+    import http.server
+    import threading
+    import time
+    from urllib.parse import parse_qs, urlparse
+
+    sample_audio = _make_synthetic_voice_wav(392.0, 1.0)
+
+    class MockMusicDlHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+            if parsed.path == "/music/api/ai/index":
+                body = json.dumps({"name": "go-music-dl", "sources": {"song": ["netease", "qq", "kugou"]}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if parsed.path == "/music/search":
+                stype = (qs.get("type") or ["song"])[0]
+                if stype == "playlist":
+                    html_doc = (
+                        '<div class="playlist-card"><button class="ctrl-btn primary" '
+                        'data-name="华语经典怀旧歌单" data-cover="" data-creator="音乐达人" '
+                        'data-track-count="50" data-source="qq" data-external-id="pl-101" '
+                        'data-content-type="playlist"></button></div>'
+                    )
+                else:
+                    html_doc = (
+                        '<ul>'
+                        '<li class="song-card" data-id="song-live" data-source="qq" data-name="晴天 (Live版)" '
+                        'data-artist="周杰伦" data-album="演唱会" data-cover="" data-duration="280" data-extra="{}"></li>'
+                        '<li class="song-card" data-id="song-orig" data-source="netease" data-name="晴天" '
+                        'data-artist="周杰伦" data-album="叶惠美" data-cover="" data-duration="269" '
+                        'data-extra=\'{"hash":"abc123"}\'></li>'
+                        '</ul>'
+                    )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(html_doc.encode("utf-8"))
+                return
+
+            if parsed.path == "/music/toplists":
+                html_doc = (
+                    '<a class="toplist-card" href="/music/toplist_songs?source=netease&amp;toplist_id=3778678'
+                    '&amp;toplist_name=%E7%83%AD%E6%AD%8C%E6%A6%9C&amp;track_count=200">'
+                    '<span><i class="fa-solid fa-headphones"></i> 88.8亿</span></a>'
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(html_doc.encode("utf-8"))
+                return
+
+            if parsed.path == "/music/toplist_songs":
+                html_doc = (
+                    '<ul><li class="song-card" data-id="top-1" data-source="netease" '
+                    'data-name="七里香" data-artist="周杰伦" data-album="七里香" '
+                    'data-cover="" data-duration="299" data-extra="{}"></li></ul>'
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(html_doc.encode("utf-8"))
+                return
+
+            if parsed.path == "/music/download":
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.end_headers()
+                self.wfile.write(sample_audio)
+                return
+
+            if parsed.path == "/music/download_lrc":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write("[00:01.00]刮风这天 我试过握着你手".encode("utf-8"))
+                return
+
+            self.send_response(404)
+            self.end_headers()
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockMusicDlHandler)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    mock_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    try:
+        with TestClient(app) as client:
+            hdr = {"Authorization": f"Bearer {client.post('/api/auth/login', json={'username': 'boss', 'password': 'pass1234'}).json()['token']}"}
+
+            # 1. 保存并探测音乐引擎连通性
+            assert client.put("/api/settings", headers=hdr, json={"music_dl_url": mock_url}).status_code == 200
+            probe = client.post("/api/settings/test-music-dl", headers=hdr, json={"music_dl_url": mock_url})
+            assert probe.status_code == 200
+            assert probe.json()["ok"] is True
+            assert "netease" in probe.json()["sources"]
+
+            # 2. 搜歌原唱智能置顶、搜歌单、热歌榜解析
+            sr = client.get("/api/cloud-music/search", headers=hdr, params={"q": "周杰伦 晴天", "search_type": "song"})
+            assert sr.status_code == 200
+            songs = sr.json()["songs"]
+            assert len(songs) == 2
+            assert songs[0]["name"] == "晴天"
+            assert songs[0]["extra"]["hash"] == "abc123"
+
+            pl = client.get("/api/cloud-music/search", headers=hdr, params={"q": "怀旧", "search_type": "playlist"})
+            assert pl.status_code == 200
+            assert pl.json()["collections"][0]["id"] == "pl-101"
+
+            tops = client.get("/api/cloud-music/toplists", headers=hdr)
+            assert tops.status_code == 200
+            assert tops.json()[0]["name"] == "热歌榜"
+            assert tops.json()[0]["play_count_text"] == "88.8亿"
+
+            top_songs = client.get("/api/cloud-music/toplists/songs", headers=hdr, params={"source": "netease", "toplist_id": "3778678"})
+            assert top_songs.status_code == 200
+            assert top_songs.json()[0]["name"] == "七里香"
+
+            # 3. 实时流代理试听
+            stream_r = client.get("/api/cloud-music/stream", params={"id": "song-orig", "source": "netease", "name": "晴天", "artist": "周杰伦"})
+            assert stream_r.status_code == 200
+            assert len(stream_r.content) > 256
+
+            # 4. 批量下载到新私有专辑（含歌词入库与 -16 LUFS 转码）
+            batch = client.post(
+                "/api/cloud-music/batch-download",
+                headers=hdr,
+                json={"songs": [songs[0]], "new_album_title": "华语金曲私有辑"},
+            )
+            assert batch.status_code == 200
+            job_id = batch.json()["job_id"]
+
+            job_done = False
+            for _ in range(30):
+                time.sleep(0.2)
+                jobs = client.get("/api/cloud-music/jobs", headers=hdr).json()
+                cur = next((j for j in jobs if j["id"] == job_id), None)
+                if cur and cur["status"] == "done":
+                    assert cur["tracks_added"] == 1
+                    job_done = True
+                    break
+            assert job_done is True
+
+            albs = client.get("/api/media/albums?exclude_inbox=true", headers=hdr).json()
+            target_alb = next((a for a in albs if a["title"] == "华语金曲私有辑"), None)
+            assert target_alb is not None
+            assert len(target_alb["tracks"]) == 1
+            tr = target_alb["tracks"][0]
+            assert tr["title"] == "晴天 - 周杰伦"
+            assert "刮风这天" in tr["text_content"]
+
+            r_local_play = client.get(f"/api/media/tracks/{tr['id']}/stream")
+            assert r_local_play.status_code == 200
+            assert len(r_local_play.content) > 256
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+

@@ -46,8 +46,8 @@ export function AuthPage({
             <Volume2 className="h-6 w-6" />
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight">EchoMind · 声忆智能中枢</h1>
-            <p className="text-xs text-[var(--ink-muted)]">全龄段家庭音频库 · 声纹记忆 · 音箱播控台</p>
+            <h1 className="text-xl font-bold tracking-tight">EchoMind · 声忆云音乐与音箱中枢</h1>
+            <p className="text-xs text-[var(--ink-muted)]">无限听歌 · 云端攒曲库 · 播客追更 · 音箱播控 · 家人声纹记忆</p>
           </div>
         </div>
 

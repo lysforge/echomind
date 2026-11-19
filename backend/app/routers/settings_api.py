@@ -36,12 +36,20 @@ class SettingsUpdate(BaseModel):
     quiet_hours_enabled: bool | None = None
     quiet_hours_start: str | None = None
     quiet_hours_end: str | None = None
+    quiet_hours_force_active: bool | None = None
+    loudnorm_target_lufs: float | None = None
+    music_dl_url: str | None = None
+    music_dl_sources: str | None = None
 
 
 class TestLLMRequest(BaseModel):
     llm_base_url: str | None = None
     llm_api_key: str | None = None
     llm_model: str | None = None
+
+
+class TestMusicDlRequest(BaseModel):
+    music_dl_url: str | None = None
 
 
 def _public_settings_payload() -> dict[str, Any]:
@@ -72,6 +80,8 @@ def _public_settings_payload() -> dict[str, Any]:
         "quiet_hours_end": s.quiet_hours_end,
         "quiet_hours_force_active": s.quiet_hours_force_active,
         "loudnorm_target_lufs": s.loudnorm_target_lufs,
+        "music_dl_url": s.music_dl_url,
+        "music_dl_sources": s.music_dl_sources,
         "hardware_endpoints": {
             "lan_ip": lan_ip,
             "port": s.server_port,
@@ -161,3 +171,14 @@ async def test_llm_connectivity(
     except Exception as exc:
         latency_ms = int((time.perf_counter() - t0) * 1000)
         return {"ok": False, "latency_ms": latency_ms, "error": str(exc)}
+
+
+@router.post("/test-music-dl")
+async def test_music_dl_connectivity(
+    req: TestMusicDlRequest,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """探测多源云音乐引擎（go-music-dl）连通性与可用音源平台。"""
+    from app.services.music_dl import check_music_dl_health
+
+    return await check_music_dl_health(url_override=req.music_dl_url)
