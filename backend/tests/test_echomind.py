@@ -78,6 +78,8 @@ def test_device_lifecycle_discovery_and_volume_guard():
     with TestClient(app) as client:
         login = client.post("/api/auth/login", json={"username": "boss", "password": "pass1234"}).json()
         hdr = {"Authorization": f"Bearer {login['token']}"}
+        assert client.put("/api/settings", headers=hdr, json={"quiet_hours_enabled": False}).status_code == 200
+        assert client.post("/api/schedules/quiet-toggle", headers=hdr, json={"active": False}).status_code == 200
 
         # 1. 手动添加客厅音箱（上限 65%）
         dev = client.post(
@@ -137,6 +139,8 @@ def test_full_age_books_sources_and_media_crud():
     with TestClient(app) as client:
         login = client.post("/api/auth/login", json={"username": "boss", "password": "pass1234"}).json()
         hdr = {"Authorization": f"Bearer {login['token']}"}
+        assert client.put("/api/settings", headers=hdr, json={"quiet_hours_enabled": False}).status_code == 200
+        assert client.post("/api/schedules/quiet-toggle", headers=hdr, json={"active": False}).status_code == 200
 
         # 1. 管理员一键导入全年龄段示范包（覆盖 S1_0_3 ~ S5_12_18 及 Pre_A1 ~ B2_PLUS）
         seeded = client.post("/api/admin/seed-sample-catalog", headers=hdr)
@@ -211,6 +215,8 @@ def test_dynamic_growth_voiceprint_isolation_and_schedules():
     with TestClient(app) as client:
         login = client.post("/api/auth/login", json={"username": "boss", "password": "pass1234"}).json()
         hdr = {"Authorization": f"Bearer {login['token']}"}
+        assert client.put("/api/settings", headers=hdr, json={"quiet_hours_enabled": False}).status_code == 200
+        assert client.post("/api/schedules/quiet-toggle", headers=hdr, json={"active": False}).status_code == 200
 
         # 1. 创建一位 10 岁（2016-05 出生）的孩子与一位爸爸成员
         teen = client.post(
@@ -269,6 +275,9 @@ def test_dynamic_growth_voiceprint_isolation_and_schedules():
         ).status_code == 200
         assert client.delete(f"/api/schedules/{sch_id}", headers=hdr).status_code == 200
         assert SafeMotionGuard.sanitize("spin_slow", 5000, 95)["speed"] == 40
+        assert client.post("/api/schedules/quiet-toggle", headers=hdr, json={"active": True}).status_code == 200
+        assert SafeMotionGuard.sanitize("spin_slow", 5000, 95)["speed"] == 0
+        assert client.post("/api/schedules/quiet-toggle", headers=hdr, json={"active": False}).status_code == 200
 
 
 def test_structured_english_courses_local_scan_and_voice_cache_fallback(monkeypatch):
@@ -283,6 +292,8 @@ def test_structured_english_courses_local_scan_and_voice_cache_fallback(monkeypa
     with TestClient(app) as client:
         login = client.post("/api/auth/login", json={"username": "boss", "password": "pass1234"}).json()
         hdr = {"Authorization": f"Bearer {login['token']}"}
+        assert client.put("/api/settings", headers=hdr, json={"quiet_hours_enabled": False}).status_code == 200
+        assert client.post("/api/schedules/quiet-toggle", headers=hdr, json={"active": False}).status_code == 200
 
         # 1. 验证 6 套 24 节英语系列课与主题生成 4 节定制课
         seed_res = client.post("/api/english/courses/seed-builtin", headers=hdr)
