@@ -1,0 +1,167 @@
+@import "tailwindcss";
+
+/* 默认主题：暖阳电台风 (radio) */
+:root,
+:root[data-theme="radio"] {
+  color-scheme: light;
+  --bg-canvas: #fafafa;
+  --bg-sidebar: #ffffff;
+  --bg-card: #ffffff;
+  --bg-subtle: #f4f4f5;
+  --ink-primary: #18181b;
+  --ink-secondary: #3f3f46;
+  --ink-muted: #71717a;
+  --brand-primary: #ea580c;
+  --brand-primary-hover: #c2410c;
+  --brand-primary-soft: #fff7ed;
+  --brand-primary-soft-hover: #ffedd5;
+  --brand-accent: #e11d48;
+  --brand-accent-soft: #fff1f2;
+  --border-soft: #e4e4e7;
+  --scrollbar-thumb: #d4d4d8;
+
+  /* 语义别名 */
+  --brand-green: var(--brand-primary);
+  --brand-green-hover: var(--brand-primary-hover);
+  --brand-green-soft: var(--brand-primary-soft);
+  --brand-amber: var(--brand-accent);
+  --brand-amber-soft: var(--brand-accent-soft);
+}
+
+/* 主题二：极简靛蓝风 (indigo) */
+:root[data-theme="indigo"] {
+  color-scheme: light;
+  --bg-canvas: #f8fafc;
+  --bg-sidebar: #ffffff;
+  --bg-card: #ffffff;
+  --bg-subtle: #f1f5f9;
+  --ink-primary: #0f172a;
+  --ink-secondary: #334155;
+  --ink-muted: #64748b;
+  --brand-primary: #4f46e5;
+  --brand-primary-hover: #4338ca;
+  --brand-primary-soft: #eef2ff;
+  --brand-primary-soft-hover: #e0e7ff;
+  --brand-accent: #0ea5e9;
+  --brand-accent-soft: #f0f9ff;
+  --border-soft: #e2e8f0;
+  --scrollbar-thumb: #cbd5e1;
+}
+
+/* 主题三：晴空伴学风 (sky) */
+:root[data-theme="sky"] {
+  color-scheme: light;
+  --bg-canvas: #f4f9fd;
+  --bg-sidebar: #ffffff;
+  --bg-card: #ffffff;
+  --bg-subtle: #ebf3fa;
+  --ink-primary: #0c2438;
+  --ink-secondary: #2c4a63;
+  --ink-muted: #5c7993;
+  --brand-primary: #0284c7;
+  --brand-primary-hover: #0369a1;
+  --brand-primary-soft: #e0f2fe;
+  --brand-primary-soft-hover: #bae6fd;
+  --brand-accent: #f59e0b;
+  --brand-accent-soft: #fef3c7;
+  --border-soft: #dbe8f4;
+  --scrollbar-thumb: #bfd4e8;
+}
+
+/* 主题四：深邃黑胶音响风 (vinyl) */
+:root[data-theme="vinyl"] {
+  color-scheme: dark;
+  --bg-canvas: #0b1120;
+  --bg-sidebar: #0f172a;
+  --bg-card: #162033;
+  --bg-subtle: #1e293b;
+  --ink-primary: #f1f5f9;
+  --ink-secondary: #cbd5e1;
+  --ink-muted: #94a3b8;
+  --brand-primary: #0891b2;
+  --brand-primary-hover: #06b6d4;
+  --brand-primary-soft: rgba(6, 182, 212, 0.16);
+  --brand-primary-soft-hover: rgba(6, 182, 212, 0.26);
+  --brand-accent: #f59e0b;
+  --brand-accent-soft: rgba(245, 158, 11, 0.16);
+  --border-soft: #263449;
+  --scrollbar-thumb: #334155;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-canvas);
+  color: var(--ink-primary);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+.card-pro {
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 1.125rem;
+  box-shadow: 0 2px 14px -4px rgba(15, 23, 42, 0.06);
+  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+/* 深邃黑胶模式：全站表单与表面语义化适配，防止浅色硬编码产生刺眼白块 */
+[data-theme="vinyl"] .card-pro {
+  box-shadow: 0 6px 24px -6px rgba(2, 6, 23, 0.55);
+}
+
+[data-theme="vinyl"] input:not([type="range"]):not([type="checkbox"]):not([type="radio"]),
+[data-theme="vinyl"] select,
+[data-theme="vinyl"] textarea {
+  background-color: #0f172a;
+  color: var(--ink-primary);
+  border-color: var(--border-soft);
+}
+
+[data-theme="vinyl"] input::placeholder,
+[data-theme="vinyl"] textarea::placeholder {
+  color: #64748b;
+}
+
+[data-theme="vinyl"] .bg-white,
+[data-theme="vinyl"] .bg-white\/95 {
+  background-color: var(--bg-card);
+}
+
+[data-theme="vinyl"] .bg-zinc-50,
+[data-theme="vinyl"] .bg-zinc-100 {
+  background-color: var(--bg-subtle);
+}
+
+[data-theme="vinyl"] .hover\:bg-zinc-50:hover,
+[data-theme="vinyl"] .hover\:bg-zinc-100:hover,
+[data-theme="vinyl"] .hover\:bg-zinc-200:hover {
+  background-color: #273549;
+}
+
+[data-theme="vinyl"] .text-zinc-600,
+[data-theme="vinyl"] .text-zinc-700,
+[data-theme="vinyl"] .text-zinc-800 {
+  color: var(--ink-secondary);
+}
+
+[data-theme="vinyl"] .text-zinc-900 {
+  color: var(--ink-primary);
+}
+
+[data-theme="vinyl"] .border-zinc-200,
+[data-theme="vinyl"] .border-zinc-300 {
+  border-color: var(--border-soft);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

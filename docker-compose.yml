@@ -1,0 +1,11 @@
+services:
+  echomind:
+    build: .
+    container_name: echomind
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./data:/app/data
+      # 如需挂载宿主机已有本地音频目录，可取消下一行注释：
+      # - /path/to/your/audio:/mnt/audio:ro
+    restart: unless-stopped

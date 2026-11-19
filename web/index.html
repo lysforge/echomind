@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EchoMind · 声忆家庭智能音箱中枢</title>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("echomind_theme") || "radio";
+          if (!["radio", "indigo", "sky", "vinyl"].includes(t)) t = "radio";
+          document.documentElement.dataset.theme = t;
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
