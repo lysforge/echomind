@@ -28,8 +28,9 @@ class PushPlaybackRequest(BaseModel):
 
 
 class RoomControlRequest(BaseModel):
-    action: Literal["pause", "resume", "stop", "next", "prev", "jump", "set_loop", "set_sleep"]
+    action: Literal["pause", "resume", "stop", "next", "prev", "jump", "replay", "seek_delta", "set_loop", "set_sleep"]
     index: int | None = None
+    delta_sec: float | None = None
     loop_mode: Literal["sequential", "repeat_one", "shuffle"] | None = None
     sleep_minutes: int | None = None
     sleep_episodes: int | None = None
@@ -189,6 +190,7 @@ async def control_room_playback(
         device_id=device_id,
         action=req.action,
         index=req.index,
+        delta_sec=req.delta_sec,
         loop_mode=req.loop_mode,
         sleep_minutes=req.sleep_minutes,
         sleep_episodes=req.sleep_episodes,

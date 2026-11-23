@@ -1,21 +1,26 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   Award,
   BookOpen,
+  Calendar,
   CheckCircle2,
   Circle,
   Clock,
   Download,
+  Flame,
   GraduationCap,
+  Mic,
   Play,
   Plus,
+  RotateCcw,
   Sparkles,
   Speaker,
+  Star,
   Trash2,
   Upload,
   Volume2,
 } from "lucide-react";
-import { api, DashboardData, EnglishLevel, MediaAlbum, MediaSeries, MediaTrack } from "../api";
+import { api, DashboardData, EnglishCheckinStats, EnglishLevel, MediaAlbum, MediaSeries, MediaTrack } from "../api";
 import { EmptyState, Modal } from "../components/Modal";
 import { QueueItem } from "../components/PlayerBar";
 import { PushTargetSpec, QuickPushModal } from "../components/QuickPushModal";
@@ -44,6 +49,7 @@ function fmtTime(sec?: number): string {
 
 export function EnglishEnlightenmentPage({
   dashboard,
+  memberKey = "",
   refreshSignal,
   onPlayQueue,
   onPlayUrl,
@@ -51,6 +57,7 @@ export function EnglishEnlightenmentPage({
   showToast,
 }: {
   dashboard: DashboardData;
+  memberKey?: string;
   refreshSignal: number;
   onPlayQueue: (items: QueueItem[], startIndex: number) => void;
   onPlayUrl: (url: string) => void;
@@ -58,11 +65,19 @@ export function EnglishEnlightenmentPage({
   showToast: (m: string) => void;
 }) {
   const [allSeries, setAllSeries] = useState<MediaSeries[]>([]);
+  const [checkinStats, setCheckinStats] = useState<EnglishCheckinStats | null>(null);
   const [activeLevel, setActiveLevel] = useState<LevelDef["code"]>("L1");
   const [selectedSeriesId, setSelectedSeriesId] = useState<number | null>(null);
   const [selectedSeasonId, setSelectedSeasonId] = useState<number | null>(null);
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
+
+  // 慢速磨耳朵 / 单句点读 / 孩子跟读录音回放与打分
+  const [slowMode, setSlowMode] = useState(false);
+  const [recordingSentence, setRecordingSentence] = useState("");
+  const [lastRecordUrl, setLastRecordUrl] = useState("");
+  const [speechEval, setSpeechEval] = useState<{ expected_text: string; recognized_text: string; stars: number; feedback: string } | null>(null);
+  const recordAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // 音箱推送弹窗
   const [pushTarget, setPushTarget] = useState<PushTargetSpec | null>(null);
@@ -90,14 +105,18 @@ export function EnglishEnlightenmentPage({
   const loadEnglishSeries = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await api.listSeries({ channel: "english" });
+      const [data, st] = await Promise.all([
+        api.listSeries({ channel: "english", member_key: memberKey || undefined }),
+        api.getEnglishStats(memberKey || ""),
+      ]);
       setAllSeries(data);
+      setCheckinStats(st);
     } catch (e) {
       showToast((e as Error).message);
     } finally {
       setLoading(false);
     }
-  }, [showToast]);
+  }, [memberKey, showToast]);
 
   useEffect(() => {
     void loadEnglishSeries();
@@ -158,7 +177,9 @@ export function EnglishEnlightenmentPage({
       durationSec: t.duration_sec || 0,
       startPositionSec: startTrackId && t.id === startTrackId ? startPos : 0,
       episodeNum: t.episode_num,
+      seasonNum: season.season_num || 1,
       seasonLabel: seaLbl,
+      seriesId: series.id,
       seriesTitle: series.title,
     }));
     const idx = startTrackId ? Math.max(0, items.findIndex((x) => x.id === startTrackId)) : 0;
@@ -183,22 +204,65 @@ export function EnglishEnlightenmentPage({
     const next = !(tr.completed === 1);
     try {
       await api.updateTrack(tr.id, { completed: next });
-      showToast(next ? `打卡成功！已完成《${tr.title}》` : `已取消《${tr.title}》完成标记`);
+      if (next) {
+        const st = await api.recordEnglishCheckin({
+          track_id: tr.id,
+          duration_min: Math.max(3, Math.round((tr.duration_sec || 180) / 60)),
+          note: `完成课时：${tr.title}`,
+          member_key: memberKey || "",
+        });
+        setCheckinStats(st);
+        showToast(`🎉 打卡成功！已连续启蒙 ${st.streak_days} 天`);
+      } else {
+        showToast(`已取消《${tr.title}》完成标记`);
+      }
       await loadEnglishSeries();
     } catch (e) {
       showToast((e as Error).message);
     }
   };
 
-  const handlePronounce = async (word: string) => {
+  const handlePronounce = async (word: string, rateOverride?: string) => {
     setSpeakingWord(word);
     try {
-      const res = await api.pronounceEnglish(word, "-8%");
+      const res = await api.pronounceEnglish(word, rateOverride || (slowMode ? "-24%" : "-8%"));
       onPlayUrl(res.tts_url);
     } catch (e) {
       showToast((e as Error).message);
     } finally {
       window.setTimeout(() => setSpeakingWord(""), 800);
+    }
+  };
+
+  const handleFollowReadRecord = async (sentence: string, trackId?: number) => {
+    if (recordingSentence) return;
+    setRecordingSentence(sentence);
+    setSpeechEval(null);
+    showToast("请跟着大声读出来（录音 3.5 秒）...");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const rec = new MediaRecorder(stream);
+      const chunks: BlobPart[] = [];
+      rec.ondataavailable = (ev) => ev.data.size > 0 && chunks.push(ev.data);
+      const blob = await new Promise<Blob>((resolve) => {
+        rec.onstop = () => {
+          stream.getTracks().forEach((t) => t.stop());
+          resolve(new Blob(chunks, { type: "audio/webm" }));
+        };
+        rec.start();
+        window.setTimeout(() => rec.state !== "inactive" && rec.stop(), 3500);
+      });
+      if (lastRecordUrl) URL.revokeObjectURL(lastRecordUrl);
+      const localUrl = URL.createObjectURL(blob);
+      setLastRecordUrl(localUrl);
+      const evalRes = await api.evaluateEnglishSpeech(sentence, blob, trackId, memberKey || "");
+      setSpeechEval(evalRes);
+      const st = await api.getEnglishStats(memberKey || "");
+      setCheckinStats(st);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "麦克风录音失败，请检查浏览器录音权限");
+    } finally {
+      setRecordingSentence("");
     }
   };
 
@@ -313,6 +377,48 @@ export function EnglishEnlightenmentPage({
           )}
         </div>
       </div>
+
+      {/* 7 天英语打卡日历与成长成就条 */}
+      {checkinStats && (
+        <section className="card-pro flex flex-wrap items-center justify-between gap-4 p-4">
+          <div className="flex flex-wrap items-center gap-4 text-xs">
+            <div className="flex items-center gap-2">
+              <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-100 text-amber-600">
+                <Flame className="h-5 w-5" />
+              </span>
+              <div>
+                <div className="text-[11px] text-[var(--ink-muted)]">连续启蒙打卡</div>
+                <div className="text-base font-extrabold text-[var(--ink-primary)]">{checkinStats.streak_days} 天</div>
+              </div>
+            </div>
+            <div className="h-8 w-px bg-[var(--border-soft)]" />
+            <div>
+              <div className="text-[11px] text-[var(--ink-muted)]">累计磨耳朵</div>
+              <div className="text-sm font-extrabold text-[var(--ink-primary)]">
+                {checkinStats.total_minutes} 分钟 · {checkinStats.total_checkins} 次
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            <Calendar className="mr-1 hidden h-3.5 w-3.5 text-[var(--ink-muted)] sm:block" />
+            {checkinStats.last_7_days.map((d) => (
+              <div
+                key={d.date}
+                title={`${d.date}：${d.checked ? `已打卡 ${d.count} 次 (${d.minutes} 分钟)` : "未打卡"}`}
+                className={`flex flex-col items-center rounded-xl border px-2.5 py-1.5 text-[10px] font-bold ${
+                  d.checked
+                    ? "border-[var(--brand-primary)] bg-[var(--brand-green-soft)] text-[var(--brand-primary)]"
+                    : "border-[var(--border-soft)] bg-[var(--bg-subtle)] text-[var(--ink-muted)]"
+                }`}
+              >
+                <span>{d.label}</span>
+                <span className="mt-0.5 text-xs">{d.checked ? "🌸" : "·"}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* 继续上次启蒙主卡 */}
       {lastStudiedSeries && (
@@ -700,13 +806,100 @@ export function EnglishEnlightenmentPage({
                           </div>
                         )}
 
-                        {/* 双语台词与听读文本 */}
+                        {/* 伴读讲稿：单句分句点读 + 0.75x 慢速磨耳朵 + 跟读录音回放打分 */}
                         {currentTrack.text_content && (
-                          <div className="rounded-xl border border-[var(--border-soft)] bg-white p-3.5">
-                            <div className="mb-1.5 text-xs font-bold text-[var(--ink-secondary)]">📖 伴读讲稿 / 跟读脚本</div>
-                            <p className="whitespace-pre-wrap text-xs leading-relaxed text-[var(--ink-primary)]">
-                              {currentTrack.text_content}
-                            </p>
+                          <div className="space-y-3 rounded-xl border border-[var(--border-soft)] bg-white p-3.5">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="text-xs font-bold text-[var(--ink-secondary)]">
+                                📖 单句精听与开口跟读（点任意一句听标准发音，点麦克风跟读录音）
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setSlowMode((v) => !v)}
+                                  className={`rounded-lg border px-2.5 py-1 text-[11px] font-bold transition ${
+                                    slowMode
+                                      ? "border-[var(--brand-primary)] bg-[var(--brand-green-soft)] text-[var(--brand-primary)]"
+                                      : "border-[var(--border-soft)] bg-zinc-50 text-[var(--ink-secondary)]"
+                                  }`}
+                                >
+                                  {slowMode ? "🐢 0.75x 慢速磨耳朵" : "🐇 正常语速"}
+                                </button>
+                                {lastRecordUrl && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (!recordAudioRef.current) recordAudioRef.current = new Audio();
+                                      recordAudioRef.current.src = lastRecordUrl;
+                                      void recordAudioRef.current.play();
+                                    }}
+                                    className="inline-flex items-center gap-1 rounded-lg bg-emerald-50 px-2.5 py-1 text-[11px] font-bold text-emerald-700 hover:bg-emerald-100"
+                                  >
+                                    <RotateCcw className="h-3 w-3" /> 回放我的录音
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* 跟读星级评语卡 */}
+                            {speechEval && (
+                              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50/90 px-3 py-2 text-xs">
+                                <div>
+                                  <div className="flex items-center gap-1 font-extrabold text-amber-800">
+                                    {Array.from({ length: 5 }).map((_, i) => (
+                                      <Star
+                                        key={i}
+                                        className={`h-3.5 w-3.5 ${i < speechEval.stars ? "fill-amber-400 text-amber-500" : "text-amber-200"}`}
+                                      />
+                                    ))}
+                                    <span className="ml-1">{speechEval.feedback}</span>
+                                  </div>
+                                  {speechEval.recognized_text && (
+                                    <div className="mt-0.5 text-[11px] text-amber-700">
+                                      识别内容：{speechEval.recognized_text}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+
+                            <div className="space-y-1.5">
+                              {currentTrack.text_content
+                                .split(/\n+|(?<=[.!?。！？])\s+/)
+                                .map((line) => line.trim())
+                                .filter((line) => line.length > 1)
+                                .slice(0, 14)
+                                .map((sentence, sIdx) => {
+                                  const isRec = recordingSentence === sentence;
+                                  return (
+                                    <div
+                                      key={sIdx}
+                                      className="flex items-center justify-between gap-2 rounded-xl border border-[var(--border-soft)] bg-[var(--bg-subtle)]/40 px-3 py-2 text-xs"
+                                    >
+                                      <button
+                                        type="button"
+                                        onClick={() => void handlePronounce(sentence)}
+                                        className="flex min-w-0 flex-1 items-center gap-2 text-left hover:text-[var(--brand-primary)]"
+                                      >
+                                        <Volume2 className="h-3.5 w-3.5 shrink-0 text-[var(--brand-primary)]" />
+                                        <span className="leading-relaxed">{sentence}</span>
+                                      </button>
+                                      <button
+                                        type="button"
+                                        disabled={Boolean(recordingSentence)}
+                                        onClick={() => void handleFollowReadRecord(sentence, currentTrack.id)}
+                                        className={`inline-flex shrink-0 items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-bold transition ${
+                                          isRec
+                                            ? "animate-pulse bg-rose-500 text-white"
+                                            : "border border-[var(--border-soft)] bg-white text-[var(--ink-secondary)] hover:border-[var(--brand-primary)] hover:text-[var(--brand-primary)]"
+                                        }`}
+                                      >
+                                        <Mic className="h-3 w-3" /> {isRec ? "录音中..." : "跟读"}
+                                      </button>
+                                    </div>
+                                  );
+                                })}
+                            </div>
                           </div>
                         )}
                       </div>

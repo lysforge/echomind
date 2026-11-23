@@ -375,6 +375,42 @@ CREATE TABLE IF NOT EXISTS category_tags (
     created_at TEXT NOT NULL,
     UNIQUE(channel, name)
 );
+
+CREATE TABLE IF NOT EXISTS user_playback_progress (
+    member_key TEXT NOT NULL,
+    series_id INTEGER NOT NULL REFERENCES media_series(id) ON DELETE CASCADE,
+    album_id INTEGER REFERENCES media_albums(id) ON DELETE SET NULL,
+    track_id INTEGER REFERENCES media_tracks(id) ON DELETE SET NULL,
+    position_sec REAL NOT NULL DEFAULT 0.0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (member_key, series_id)
+);
+
+CREATE TABLE IF NOT EXISTS study_checkins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    member_key TEXT NOT NULL DEFAULT 'default',
+    checkin_date TEXT NOT NULL,
+    track_id INTEGER REFERENCES media_tracks(id) ON DELETE SET NULL,
+    duration_min REAL NOT NULL DEFAULT 5.0,
+    spoken_score INTEGER NOT NULL DEFAULT 0,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS webdav_mounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    base_url TEXT NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
+    password TEXT NOT NULL DEFAULT '',
+    remote_path TEXT NOT NULL DEFAULT '/',
+    channel TEXT NOT NULL DEFAULT 'story' CHECK(channel IN ('music', 'story', 'english', 'podcast')),
+    level_code TEXT NOT NULL DEFAULT '',
+    last_synced_at TEXT,
+    last_status TEXT NOT NULL DEFAULT '尚未同步',
+    tracks_synced INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
 """
 
 DEFAULT_CATEGORY_TAGS: list[tuple[str, str, int]] = [

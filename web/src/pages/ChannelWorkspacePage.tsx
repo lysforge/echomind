@@ -79,6 +79,7 @@ const CHANNEL_META = {
 export function ChannelWorkspacePage({
   channel,
   dashboard,
+  memberKey = "",
   refreshSignal,
   focusSeriesId,
   onClearFocusSeries,
@@ -88,6 +89,7 @@ export function ChannelWorkspacePage({
 }: {
   channel: "story" | "music" | "podcast";
   dashboard: DashboardData;
+  memberKey?: string;
   refreshSignal: number;
   focusSeriesId?: number | null;
   onClearFocusSeries?: () => void;
@@ -162,14 +164,18 @@ export function ChannelWorkspacePage({
   const loadSeries = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await api.listSeries({ channel, q: searchQ.trim() || undefined });
+      const data = await api.listSeries({
+        channel,
+        q: searchQ.trim() || undefined,
+        member_key: memberKey || undefined,
+      });
       setSeriesList(data);
     } catch (e) {
       showToast((e as Error).message);
     } finally {
       setLoading(false);
     }
-  }, [channel, searchQ, showToast]);
+  }, [channel, searchQ, memberKey, showToast]);
 
   // 切换频道时复位选中项
   useEffect(() => {
@@ -216,7 +222,9 @@ export function ChannelWorkspacePage({
       durationSec: t.duration_sec || 0,
       startPositionSec: resumeTrackId && t.id === resumeTrackId ? resumePosSec : 0,
       episodeNum: t.episode_num,
+      seasonNum: season.season_num || 1,
       seasonLabel: seaLbl,
+      seriesId: series.id,
       seriesTitle: series.title,
     }));
   };

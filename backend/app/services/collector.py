@@ -828,6 +828,33 @@ def _infer_media_kind(folder_media_type: str, rel_parts: tuple[str, ...]) -> str
     return "music"
 
 
+def _read_audio_id3_tags(af: Path) -> dict[str, Any]:
+    """借助 mutagen 安全读取本地音频文件内嵌 ID3/FLAC/MP4 元数据（歌手/专辑/曲名/音轨号）。"""
+    try:
+        import mutagen
+
+        mf = mutagen.File(str(af), easy=True)
+        if not mf:
+            return {}
+
+        def _first(key: str) -> str:
+            val = mf.get(key)
+            if isinstance(val, list) and val:
+                return str(val[0]).strip()
+            return str(val).strip() if val else ""
+
+        track_raw = _first("tracknumber").split("/")[0].strip()
+        track_num = int(track_raw) if track_raw.isdigit() else None
+        return {
+            "artist": _first("artist") or _first("albumartist"),
+            "album": _first("album"),
+            "title": _first("title"),
+            "track_num": track_num,
+        }
+    except Exception:
+        return {}
+
+
 async def scan_local_folder(folder_id: int) -> dict[str, Any]:
     """扫描已挂载本地文件夹内的音频（支持音乐、故事专辑以及绘本图书章节+.txt文本伴读）。"""
     async with get_db() as conn:
@@ -901,24 +928,63 @@ async def scan_local_folder(folder_id: int) -> dict[str, Any]:
                     await conn.commit()
                 chapters_added += 1
         else:
-            album_title = parent_name
-            if parent_name.lower() in ("music", "story", "音乐", "故事"):
-                album_title = f"{folder_dict['name']}·{'故事集' if kind == 'story' else '本地曲库'}"
-            async with get_db() as conn:
-                cur_a = await conn.execute("SELECT id FROM media_albums WHERE title = ?", (album_title,))
-                arow = await cur_a.fetchone()
-                if arow:
-                    alb_id = int(arow["id"])
+            from app.services.ai_curator import ensure_series_and_season, extract_episode_number_from_title, parse_cn_number
+
+            meaningful_dirs = [
+                p for p in rel.parts[:-1] if p.lower() not in ("music", "story", "english", "podcast", "音乐", "故事", "英语", "播客")
+            ]
+            tags = _read_audio_id3_tags(af) if kind == "music" else {}
+            track_title = tags.get("title") or af.stem
+            ep_num = tags.get("track_num") or extract_episode_number_from_title(af.stem)
+
+            if len(meaningful_dirs) >= 2:
+                # 两级子目录（例如 汪汪队/第2季/01_海上巡逻.mp3）直接映射为三级分类树
+                series_title = meaningful_dirs[-2]
+                raw_season = meaningful_dirs[-1]
+                m_s = re.search(r"第\s*([一二两三四五六七八九十\d]+)\s*([季部辑册单元])", raw_season)
+                if m_s:
+                    s_num = parse_cn_number(m_s.group(1)) or 1
+                    s_label = f"第{s_num}{m_s.group(2)}"
                 else:
-                    cur_ins = await conn.execute(
-                        """
-                        INSERT INTO media_albums (title, category, age_stage, english_level, play_mode, description, created_at)
-                        VALUES (?, ?, ?, 'Pre_A1', 'sequential', ?, ?)
-                        """,
-                        (album_title, kind, folder_dict["age_stage"], f"本地目录 {af.parent} 扫描归档", ts),
-                    )
-                    alb_id = int(cur_ins.lastrowid)
-                await conn.commit()
+                    m_s2 = re.search(r"[Ss](?:eason)?\s*0*(\d+)", raw_season)
+                    s_num = max(1, int(m_s2.group(1))) if m_s2 else 1
+                    s_label = f"第{s_num}季" if m_s2 else raw_season
+                _, alb_dict = await ensure_series_and_season(
+                    channel=kind,
+                    series_title=series_title,
+                    season_num=s_num,
+                    season_label=s_label,
+                )
+                alb_id = int(alb_dict["id"])
+            elif kind == "music" and tags.get("artist"):
+                # 音乐文件含 ID3 歌手标签：自动按 歌手(Series) -> 专辑(Season) -> 单曲 归档
+                _, alb_dict = await ensure_series_and_season(
+                    channel="music",
+                    series_title=tags["artist"],
+                    season_num=1,
+                    season_label=tags.get("album") or "精选辑",
+                    author=tags["artist"],
+                )
+                alb_id = int(alb_dict["id"])
+            else:
+                album_title = parent_name
+                if parent_name.lower() in ("music", "story", "音乐", "故事"):
+                    album_title = f"{folder_dict['name']}·{'故事集' if kind == 'story' else '本地曲库'}"
+                async with get_db() as conn:
+                    cur_a = await conn.execute("SELECT id FROM media_albums WHERE title = ?", (album_title,))
+                    arow = await cur_a.fetchone()
+                    if arow:
+                        alb_id = int(arow["id"])
+                    else:
+                        cur_ins = await conn.execute(
+                            """
+                            INSERT INTO media_albums (title, category, age_stage, english_level, play_mode, description, created_at)
+                            VALUES (?, ?, ?, 'Pre_A1', 'sequential', ?, ?)
+                            """,
+                            (album_title, kind, folder_dict["age_stage"], f"本地目录 {af.parent} 扫描归档", ts),
+                        )
+                        alb_id = int(cur_ins.lastrowid)
+                    await conn.commit()
 
             before_url = f"localfile://{af.resolve()}"
             async with get_db() as conn:
@@ -928,7 +994,7 @@ async def scan_local_folder(folder_id: int) -> dict[str, Any]:
                 )
                 already = await cur_chk.fetchone()
             if not already:
-                await insert_normalized_track(alb_id, af.stem, af, source_url=before_url)
+                await insert_normalized_track(alb_id, track_title, af, source_url=before_url, episode_num=ep_num)
                 tracks_added += 1
 
     summary = f"发现 {len(audio_files)} 个本地音频 · 新入库 {tracks_added} 首音轨 / {chapters_added} 个绘本章节"

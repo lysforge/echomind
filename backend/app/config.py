@@ -97,8 +97,15 @@ class SettingsModel(BaseModel):
 
     loudnorm_target_lufs: float = -16.0
     server_port: int = 8090
+    public_base_url: str = ""
     music_dl_url: str = Field(default_factory=lambda: os.environ.get("ECHOMIND_MUSIC_DL_URL", "http://127.0.0.1:18080"))
     music_dl_sources: str = "netease,qq,kugou,kuwo,migu,bilibili"
+    # 真·小米小爱音箱直连配置（参考 XiaoMusic / MiService）
+    mi_user: str = ""
+    mi_pass: str = ""
+    mi_poll_enabled: bool = False
+    mi_poll_interval_sec: float = Field(default=2.0, ge=1.0, le=15.0)
+    mi_trigger_keywords: str = "播放,采集,下载,继续听,跳到,下一集,上一集,暂停,停止,重播,快进,倒退"
     ffmpeg_bin: str = Field(default_factory=_find_ffmpeg)
     ffprobe_bin: str = Field(default_factory=_find_ffprobe)
     yt_dlp_bin: str = Field(default_factory=_find_yt_dlp)

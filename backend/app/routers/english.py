@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import date, timedelta
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -20,7 +22,7 @@ from app.services.english_courses import (
     seed_builtin_english_courses,
     synthesize_lesson_audio,
 )
-from app.services.tts_asr import synthesize_speech
+from app.services.tts_asr import synthesize_speech, transcribe_audio
 
 router = APIRouter(prefix="/api/english", tags=["english"])
 
@@ -64,6 +66,14 @@ class PronounceRequest(BaseModel):
     text: str
     rate: str = "-8%"
     device_id: str = ""
+
+
+class CheckinRequest(BaseModel):
+    track_id: int | None = None
+    duration_min: float = 5.0
+    spoken_score: int = 0
+    note: str = ""
+    member_key: str = ""
 
 
 # -------------------- 结构化系列课程 (Courses & Lessons) --------------------
@@ -142,6 +152,138 @@ async def pronounce_english_word(
     if req.device_id.strip():
         await device_manager.push_announcement(req.device_id.strip(), txt, tts_path=tts_path)
     return {"text": txt, "tts_url": f"/api/tts-cache/{tts_path.name}"}
+
+
+@router.post("/checkin")
+async def record_english_checkin(
+    req: CheckinRequest,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """记录一次每日英语磨耳朵/跟读打卡，并同步标记对应课时完成。"""
+    mk = req.member_key.strip() or f"user:{user['id']}"
+    today = date.today().isoformat()
+    ts = now_iso()
+    async with get_db() as conn:
+        await conn.execute(
+            """
+            INSERT INTO study_checkins (member_key, checkin_date, track_id, duration_min, spoken_score, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (mk, today, req.track_id, max(0.5, float(req.duration_min or 5.0)), int(req.spoken_score or 0), req.note.strip(), ts),
+        )
+        if req.track_id:
+            await conn.execute("UPDATE media_tracks SET completed = 1 WHERE id = ?", (req.track_id,))
+        await conn.commit()
+    return await get_english_checkin_stats(member_key=mk, user=user)
+
+
+@router.get("/stats")
+async def get_english_checkin_stats(
+    member_key: str | None = Query(default=None),
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """返回英语启蒙连续打卡天数、累计磨耳朵分钟数与近 7 天打卡日历。"""
+    mk = (member_key or "").strip() or f"user:{user['id']}"
+    async with get_db() as conn:
+        cur = await conn.execute(
+            "SELECT checkin_date, COUNT(*) AS cnt, SUM(duration_min) AS mins, MAX(spoken_score) AS best_score FROM study_checkins WHERE member_key = ? GROUP BY checkin_date ORDER BY checkin_date DESC",
+            (mk,),
+        )
+        by_date = {r["checkin_date"]: dict(r) for r in await cur.fetchall()}
+
+    today = date.today()
+    # 计算连续打卡天数（今天或昨天开始连续往前）
+    streak = 0
+    cursor = today if today.isoformat() in by_date else (today - timedelta(days=1))
+    while cursor.isoformat() in by_date:
+        streak += 1
+        cursor -= timedelta(days=1)
+
+    weekdays_zh = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    last_7: list[dict[str, Any]] = []
+    for offset in range(6, -1, -1):
+        d = today - timedelta(days=offset)
+        ds = d.isoformat()
+        info = by_date.get(ds)
+        last_7.append(
+            {
+                "date": ds,
+                "label": "今天" if offset == 0 else weekdays_zh[d.weekday()],
+                "checked": bool(info),
+                "count": int(info["cnt"]) if info else 0,
+                "minutes": round(float(info["mins"] or 0.0), 1) if info else 0.0,
+            }
+        )
+
+    total_checkins = sum(int(v["cnt"]) for v in by_date.values())
+    total_minutes = round(sum(float(v["mins"] or 0.0) for v in by_date.values()), 1)
+    return {
+        "member_key": mk,
+        "streak_days": streak,
+        "total_checkins": total_checkins,
+        "total_minutes": total_minutes,
+        "today_checked": today.isoformat() in by_date,
+        "last_7_days": last_7,
+    }
+
+
+@router.post("/evaluate-speech")
+async def evaluate_english_speech(
+    expected_text: str = Form(...),
+    track_id: int | None = Form(default=None),
+    member_key: str = Form(default=""),
+    file: UploadFile = File(...),
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """接收儿童英语跟读录音，做 ASR 词匹配或有效音频检测并给出鼓励星级与自动打卡。"""
+    audio_bytes = await file.read()
+    if len(audio_bytes) < 256:
+        raise HTTPException(status_code=400, detail="录音时间太短，请再试一次哦")
+
+    exp = expected_text.strip()
+    ext = ".webm" if (file.filename or "").endswith(".webm") else ".wav"
+    recognized = ""
+    try:
+        recognized = (await transcribe_audio(audio_bytes, input_ext=ext)).strip()
+    except Exception:
+        recognized = ""
+
+    exp_words = re.findall(r"[a-zA-Z]+", exp.lower())
+    rec_words = re.findall(r"[a-zA-Z]+", recognized.lower())
+
+    if exp_words and rec_words:
+        matched = sum(1 for w in exp_words if w in rec_words)
+        ratio = matched / max(1, len(exp_words))
+        stars = 5 if ratio >= 0.85 else 4 if ratio >= 0.6 else 3 if ratio >= 0.35 else 2
+        feedback = (
+            "太棒啦！发音非常标准，给你 5 颗星！"
+            if stars == 5
+            else "读得很不错，再大声慢读一遍会更棒哦！"
+            if stars >= 4
+            else "勇敢开口就是进步，可以点上面的原声再跟读一遍！"
+        )
+    else:
+        # 未配在线 ASR 时，依据录音有效字节数给正向鼓励星级
+        stars = 5 if len(audio_bytes) >= 8000 else 4
+        feedback = "声音洪亮、开口很棒！点击旁边按钮回放听听自己的发音，再打卡一颗小红花吧！"
+
+    mk = member_key.strip() or f"user:{user['id']}"
+    async with get_db() as conn:
+        await conn.execute(
+            """
+            INSERT INTO study_checkins (member_key, checkin_date, track_id, duration_min, spoken_score, note, created_at)
+            VALUES (?, ?, ?, 3.0, ?, ?, ?)
+            """,
+            (mk, date.today().isoformat(), track_id, stars, f"跟读：{exp[:40]}", now_iso()),
+        )
+        await conn.commit()
+
+    return {
+        "expected_text": exp,
+        "recognized_text": recognized,
+        "stars": stars,
+        "feedback": feedback,
+    }
 
 
 @router.get("/courses/{course_id}")

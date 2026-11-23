@@ -19,6 +19,7 @@ from app.routers import (
     dashboard,
     devices,
     english,
+    mcp_server,
     media,
     members,
     music_cloud,
@@ -29,6 +30,7 @@ from app.routers import (
 )
 from app.services.scheduler import scheduler_service
 from app.services.tts_asr import TTS_CACHE_DIR
+from app.services.xiaoai_bridge import xiaoai_bridge
 
 
 @asynccontextmanager
@@ -36,9 +38,11 @@ async def lifespan(_app: FastAPI):
     ensure_directories()
     await init_db()
     await scheduler_service.start()
+    xiaoai_bridge.ensure_polling_started()
     try:
         yield
     finally:
+        await xiaoai_bridge.close()
         scheduler_service.shutdown()
 
 
@@ -67,6 +71,7 @@ app.include_router(music_cloud.router)
 app.include_router(playback.router)
 app.include_router(schedules.router)
 app.include_router(settings_api.router)
+app.include_router(mcp_server.router)
 
 app.include_router(speaker_ws.router)
 app.include_router(xiaozhi_ws.router)
@@ -91,6 +96,16 @@ if (WEB_DIST_DIR / "assets").exists():
 async def serve_spa(full_path: str):
     if full_path.startswith(("api/", "ws/", "xiaozhi/")):
         raise HTTPException(status_code=404, detail="Not Found")
+    # 优先返回构建产物根目录中的真实静态文件（如 manifest.webmanifest、图标等），严防路径穿越
+    if full_path:
+        try:
+            dist_root = WEB_DIST_DIR.resolve()
+            candidate = (WEB_DIST_DIR / full_path).resolve()
+            if candidate.is_relative_to(dist_root) and candidate.is_file():
+                media_type = "application/manifest+json" if candidate.suffix == ".webmanifest" else None
+                return FileResponse(str(candidate), media_type=media_type)
+        except OSError:
+            pass
     index_file = WEB_DIST_DIR / "index.html"
     if index_file.exists():
         return FileResponse(str(index_file))

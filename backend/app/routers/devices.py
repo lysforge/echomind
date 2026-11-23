@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 from typing import Any, Literal
 
@@ -9,12 +10,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from app.auth import get_current_user
-from app.config import ROOT_DIR, get_lan_ip, load_settings
+from app.auth import get_current_user, require_admin
+from app.config import ROOT_DIR, get_lan_ip, load_settings, save_settings
 from app.db import get_db, now_iso
 from app.gateways.manager import device_manager
 from app.services.brain import SafeMotionGuard
 from app.services.tts_asr import synthesize_speech
+from app.services.xiaoai_bridge import xiaoai_bridge
 
 router = APIRouter(prefix="/api/devices", tags=["devices"])
 
@@ -294,3 +296,124 @@ async def download_bridge_script(
         content=header_comment + patched,
         headers={"Content-Disposition": f'attachment; filename="echomind_agent_{row["id"]}.py"'},
     )
+
+
+# -------------------- 真·小米小爱音箱直连发现、绑定与语音轮询 --------------------
+
+
+class XiaoAiDiscoverRequest(BaseModel):
+    mi_user: str | None = None
+    mi_pass: str | None = None
+    public_base_url: str | None = None
+    save_credentials: bool = True
+
+
+class XiaoAiBindRequest(BaseModel):
+    mi_device_id: str
+    miot_did: str = ""
+    name: str
+    hardware: str = ""
+    room: str = "客厅"
+    max_volume: int = 75
+
+
+class XiaoAiPollToggleRequest(BaseModel):
+    enabled: bool
+    poll_interval_sec: float | None = None
+    trigger_keywords: str | None = None
+
+
+@router.get("/xiaoai/status")
+async def get_xiaoai_bridge_status(_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    return await xiaoai_bridge.get_status_snapshot()
+
+
+@router.post("/xiaoai/discover")
+async def discover_xiaoai_devices(
+    req: XiaoAiDiscoverRequest,
+    _admin: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """登录小米账号并发现名下所有真实小爱音箱设备。"""
+    s = load_settings()
+    u = req.mi_user.strip() if req.mi_user else s.mi_user
+    p = req.mi_pass.strip() if (req.mi_pass and "*" not in req.mi_pass) else s.mi_pass
+    if not u or not p:
+        raise HTTPException(status_code=400, detail="请填写小米账号（手机号/邮箱/小米ID）和密码")
+    if req.save_credentials:
+        s.mi_user = u
+        s.mi_pass = p
+        if req.public_base_url is not None:
+            s.public_base_url = req.public_base_url.strip()
+        save_settings(s)
+    try:
+        devices = await xiaoai_bridge.discover_devices(u, p)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"连接小米账号失败：{exc}")
+    return {"devices": devices, "count": len(devices)}
+
+
+@router.post("/xiaoai/bind")
+async def bind_xiaoai_device(
+    req: XiaoAiBindRequest,
+    _admin: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """将发现的小米小爱真机直接绑定为 EchoMind 房间音箱（免装客户端脚本）。"""
+    mi_did = req.mi_device_id.strip()
+    if not mi_did:
+        raise HTTPException(status_code=400, detail="mi_device_id 不能为空")
+    dev_id = f"xiaoai_{mi_did[:18]}"
+    cap_json = json.dumps(
+        {
+            "transport": "xiaoai_cloud",
+            "mi_device_id": mi_did,
+            "miot_did": req.miot_did.strip(),
+            "hardware": req.hardware.strip(),
+        },
+        ensure_ascii=False,
+    )
+    ts = now_iso()
+    max_v = max(20, min(100, int(req.max_volume)))
+    async with get_db() as conn:
+        cur = await conn.execute("SELECT * FROM devices WHERE id = ?", (dev_id,))
+        if await cur.fetchone():
+            await conn.execute(
+                """
+                UPDATE devices
+                SET name = ?, room = ?, max_volume = ?, paired = 1, online = 1,
+                    capabilities_json = ?, last_seen_at = ?
+                WHERE id = ?
+                """,
+                (req.name.strip() or "小爱音箱", req.room.strip() or "客厅", max_v, cap_json, ts, dev_id),
+            )
+        else:
+            await conn.execute(
+                """
+                INSERT INTO devices
+                (id, name, device_type, room, auth_token, pair_code, paired, online, volume, max_volume,
+                 wake_word, playing_title, client_ip, motion_locked, last_seen_at, created_at, capabilities_json)
+                VALUES (?, ?, 'speaker_xiaoai', ?, ?, '', 1, 1, 50, ?, '小爱同学', '小米云直连就绪', 'xiaomi-cloud', 0, ?, ?, ?)
+                """,
+                (dev_id, req.name.strip() or "小爱音箱", req.room.strip() or "客厅", secrets.token_urlsafe(12), max_v, ts, ts, cap_json),
+            )
+        await conn.commit()
+        cur2 = await conn.execute("SELECT * FROM devices WHERE id = ?", (dev_id,))
+        row = dict(await cur2.fetchone())
+    xiaoai_bridge.ensure_polling_started()
+    return row
+
+
+@router.post("/xiaoai/poll-toggle")
+async def toggle_xiaoai_polling(
+    req: XiaoAiPollToggleRequest,
+    _admin: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    s = load_settings()
+    s.mi_poll_enabled = bool(req.enabled)
+    if req.poll_interval_sec is not None:
+        s.mi_poll_interval_sec = max(1.0, min(15.0, float(req.poll_interval_sec)))
+    if req.trigger_keywords is not None:
+        s.mi_trigger_keywords = req.trigger_keywords.strip()
+    save_settings(s)
+    if s.mi_poll_enabled:
+        xiaoai_bridge.ensure_polling_started()
+    return await xiaoai_bridge.get_status_snapshot()

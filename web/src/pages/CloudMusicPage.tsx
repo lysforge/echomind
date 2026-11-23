@@ -92,8 +92,9 @@ export function CloudMusicPage({
   const [checkedKeys, setCheckedKeys] = useState<Record<string, boolean>>({});
   const [batchModalOpen, setBatchModalOpen] = useState(false);
   const [batchPendingSongs, setBatchPendingSongs] = useState<CloudSong[]>([]);
-  const [targetMode, setTargetMode] = useState<"new" | "existing">("new");
+  const [targetMode, setTargetMode] = useState<"auto_artist" | "new" | "existing">("auto_artist");
   const [newAlbumTitle, setNewAlbumTitle] = useState("云端下载精选");
+  const [newSeasonLabel, setNewSeasonLabel] = useState("精选辑");
   const [existingAlbumId, setExistingAlbumId] = useState<number>(0);
   const [submittingBatch, setSubmittingBatch] = useState(false);
 
@@ -251,7 +252,8 @@ export function CloudMusicPage({
     }
     setBatchPendingSongs(targetList);
     setNewAlbumTitle(defaultTitle || "云端下载精选");
-    setTargetMode(musicAlbums.length > 0 ? "new" : "new");
+    setNewSeasonLabel("精选辑");
+    setTargetMode("auto_artist");
     if (musicAlbums.length > 0 && !existingAlbumId) {
       setExistingAlbumId(musicAlbums[0].id);
     }
@@ -264,7 +266,10 @@ export function CloudMusicPage({
     try {
       const res = await api.cloudMusicBatchDownload({
         songs: batchPendingSongs,
+        auto_group_by_artist: targetMode === "auto_artist",
         album_id: targetMode === "existing" && existingAlbumId > 0 ? existingAlbumId : null,
+        new_series_title: targetMode === "new" ? newAlbumTitle.trim() || "云端下载精选" : "",
+        season_label: targetMode === "new" ? newSeasonLabel.trim() || "精选辑" : "",
         new_album_title: targetMode === "new" ? newAlbumTitle.trim() || "云端下载精选" : "云端下载精选",
         category: "music",
         age_stage: "S6_ALL",
@@ -695,42 +700,68 @@ export function CloudMusicPage({
             歌曲将从全网多源引擎自动下载并经过 -16 LUFS 响度校准持久化存入服务器，同时自动同步 LRC 歌词，断网后也能在音箱离线畅听。
           </div>
 
-          <div className="grid grid-cols-2 gap-2">
+          <div className="grid grid-cols-3 gap-2">
+            <button
+              type="button"
+              onClick={() => setTargetMode("auto_artist")}
+              className={`rounded-xl border px-2 py-2 font-semibold ${
+                targetMode === "auto_artist"
+                  ? "border-[var(--brand-primary)] bg-[var(--brand-primary-soft)] text-[var(--brand-primary)]"
+                  : "border-[var(--border-soft)]"
+              }`}
+            >
+              <Sparkles className="mx-auto mb-1 h-4 w-4" /> 按歌手自动分类
+            </button>
             <button
               type="button"
               onClick={() => setTargetMode("new")}
-              className={`rounded-xl border px-3 py-2 font-semibold ${
+              className={`rounded-xl border px-2 py-2 font-semibold ${
                 targetMode === "new"
                   ? "border-[var(--brand-primary)] bg-[var(--brand-primary-soft)] text-[var(--brand-primary)]"
                   : "border-[var(--border-soft)]"
               }`}
             >
-              <FolderPlus className="mx-auto mb-1 h-4 w-4" /> 新建同名私有专辑
+              <FolderPlus className="mx-auto mb-1 h-4 w-4" /> 新建歌手/歌单
             </button>
             <button
               type="button"
               onClick={() => setTargetMode("existing")}
               disabled={musicAlbums.length === 0}
-              className={`rounded-xl border px-3 py-2 font-semibold disabled:opacity-40 ${
+              className={`rounded-xl border px-2 py-2 font-semibold disabled:opacity-40 ${
                 targetMode === "existing"
                   ? "border-[var(--brand-primary)] bg-[var(--brand-primary-soft)] text-[var(--brand-primary)]"
                   : "border-[var(--border-soft)]"
               }`}
             >
-              <ListMusic className="mx-auto mb-1 h-4 w-4" /> 追加到现有专辑
+              <ListMusic className="mx-auto mb-1 h-4 w-4" /> 追加现有专辑
             </button>
           </div>
 
-          {targetMode === "new" ? (
-            <div>
-              <label className="mb-1 block font-semibold">目标新专辑名称</label>
-              <input
-                required
-                value={newAlbumTitle}
-                onChange={(e) => setNewAlbumTitle(e.target.value)}
-                className="w-full rounded-xl border border-[var(--border-soft)] px-3 py-2 text-sm"
-                placeholder="例如：周杰伦全集 / 车载流行精选"
-              />
+          {targetMode === "auto_artist" ? (
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-emerald-800">
+              ✨ 推荐模式：系统会自动按每首歌的<b>歌手名</b>建立一级分类，再按<b>原专辑名</b>建立二级专辑（例如「周杰伦 → 范特西 → 晴天」），彻底告别曲库杂乱！
+            </div>
+          ) : targetMode === "new" ? (
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="mb-1 block font-semibold">一级歌手/歌单合集名</label>
+                <input
+                  required
+                  value={newAlbumTitle}
+                  onChange={(e) => setNewAlbumTitle(e.target.value)}
+                  className="w-full rounded-xl border border-[var(--border-soft)] px-3 py-2 text-xs"
+                  placeholder="例如：周杰伦 / 车载流行"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block font-semibold">二级专辑名</label>
+                <input
+                  value={newSeasonLabel}
+                  onChange={(e) => setNewSeasonLabel(e.target.value)}
+                  className="w-full rounded-xl border border-[var(--border-soft)] px-3 py-2 text-xs"
+                  placeholder="例如：精选辑 / 2026热歌"
+                />
+              </div>
             </div>
           ) : (
             <div>

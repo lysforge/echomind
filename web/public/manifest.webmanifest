@@ -1,0 +1,10 @@
+{
+  "name": "EchoMind · 声忆家庭声音中枢",
+  "short_name": "EchoMind",
+  "description": "面向全家人的私有云故事书架、无限音乐曲库、英语分级启蒙与智能音箱中枢",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fafafa",
+  "theme_color": "#ea580c",
+  "lang": "zh-CN"
+}

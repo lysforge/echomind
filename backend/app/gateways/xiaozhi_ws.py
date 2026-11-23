@@ -184,18 +184,21 @@ async def _handle_robot_utterance(
         pass
     await websocket.send_text(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
 
-    if brain_resp.play_track and not conn_state.get("abort"):
-        try:
-            track_frames = await encode_file_to_opus_frames(brain_resp.play_track["file_path"])
-            await websocket.send_text(json.dumps({"type": "tts", "state": "start", "session_id": session_id}))
-            for pkt in track_frames:
-                if conn_state.get("abort"):
-                    break
-                await websocket.send_bytes(pkt)
-                await asyncio.sleep(0.055)
-            await websocket.send_text(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
-        except Exception:
-            pass
+    if brain_resp.play_track and not conn_state.get("abort") and not brain_resp.skip_device_push:
+        q_list = brain_resp.queue_tracks or [brain_resp.play_track]
+        idx = next(
+            (i for i, t in enumerate(q_list) if t.get("id") == brain_resp.play_track.get("id") and t.get("title") == brain_resp.play_track.get("title")),
+            0,
+        )
+        await device_manager.push_queue_to_device(
+            device_id=device_id,
+            tracks=q_list,
+            album_id=brain_resp.play_track.get("album_id"),
+            album_title=str(brain_resp.play_track.get("album_title") or ""),
+            start_index=idx,
+            series_id=brain_resp.play_track.get("series_id"),
+            start_position_sec=float(brain_resp.play_track.get("start_position_sec") or 0.0),
+        )
 
     if motion.get("allowed") and conn_state.get("mcp_tools"):
         await websocket.send_text(

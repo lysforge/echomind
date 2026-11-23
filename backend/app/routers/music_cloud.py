@@ -41,8 +41,12 @@ class BatchDownloadSongItem(BaseModel):
 
 class BatchDownloadRequest(BaseModel):
     songs: list[BatchDownloadSongItem]
+    series_id: int | None = None
     album_id: int | None = None
+    new_series_title: str = ""
+    season_label: str = ""
     new_album_title: str = "云端下载精选"
+    auto_group_by_artist: bool = False
     category: Literal["music", "story", "english", "podcast"] = "music"
     age_stage: Literal["S1_0_3", "S2_3_6", "S3_6_9", "S4_9_12", "S5_12_18", "S6_ALL"] = "S6_ALL"
 
@@ -190,7 +194,11 @@ async def cloud_music_batch_download(
         return await enqueue_cloud_batch_download(
             songs=[s.model_dump() for s in req.songs],
             album_id=req.album_id,
+            series_id=req.series_id,
+            new_series_title=req.new_series_title,
+            season_label=req.season_label,
             new_album_title=req.new_album_title,
+            auto_group_by_artist=req.auto_group_by_artist,
             category=req.category,
             age_stage=req.age_stage,
         )

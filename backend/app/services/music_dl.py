@@ -592,7 +592,10 @@ async def _run_batch_download_job(
     album_title: str,
     songs: list[dict[str, Any]],
     base_url: str,
+    auto_group_by_artist: bool = False,
 ) -> None:
+    from app.services.ai_curator import ensure_series_and_season
+
     job_dir = MEDIA_RAW_DIR / f"cloud_batch_{job_id}_{uuid.uuid4().hex[:6]}"
     job_dir.mkdir(parents=True, exist_ok=True)
     sem = asyncio.Semaphore(3)
@@ -609,7 +612,20 @@ async def _run_batch_download_job(
                 nonlocal added, skipped, failed
                 async with sem:
                     try:
-                        outcome = await _download_single_cloud_song(client, s, base_url, target_album_id, job_dir)
+                        dest_aid = target_album_id
+                        if auto_group_by_artist:
+                            raw_artist = str(s.get("artist") or "").strip()
+                            primary_artist = re.split(r"[/、,&，]", raw_artist)[0].strip() if raw_artist else "群星精选"
+                            alb_label = str(s.get("album") or "").strip() or "精选辑"
+                            _, alb_obj = await ensure_series_and_season(
+                                channel="music",
+                                series_title=primary_artist,
+                                season_num=1,
+                                season_label=alb_label,
+                                author=primary_artist,
+                            )
+                            dest_aid = int(alb_obj["id"])
+                        outcome = await _download_single_cloud_song(client, s, base_url, dest_aid, job_dir)
                     except Exception:
                         outcome = "failed"
                     async with lock:
@@ -649,23 +665,66 @@ async def _run_batch_download_job(
 async def enqueue_cloud_batch_download(
     songs: list[dict[str, Any]],
     album_id: int | None = None,
+    series_id: int | None = None,
+    new_series_title: str = "",
+    season_label: str = "",
     new_album_title: str = "云端下载精选",
+    auto_group_by_artist: bool = False,
     category: str = "music",
     age_stage: str = "S6_ALL",
 ) -> dict[str, Any]:
-    """创建云端批量下歌并转码入库异步任务。"""
+    """创建云端批量下歌并转码入库异步任务（支持按歌手自动三级分类或归入指定歌手合集→专辑）。"""
+    from app.services.ai_curator import ensure_series_and_season
+
     base_url = normalize_music_dl_base()
     if not base_url:
         raise ValueError("尚未配置多源音乐服务地址")
     if not songs:
         raise ValueError("待下载曲目列表为空")
 
-    target_aid, target_title = await _ensure_batch_target_album(
-        album_id=album_id,
-        new_album_title=new_album_title,
-        category=category,
-        age_stage=age_stage,
-    )
+    if auto_group_by_artist:
+        _, default_alb = await ensure_series_and_season(channel=category, series_title="云端精选", season_num=1, season_label="精选辑")
+        target_aid = int(default_alb["id"])
+        target_title = "按歌手自动三级分类"
+    elif album_id:
+        target_aid, target_title = await _ensure_batch_target_album(
+            album_id=album_id,
+            new_album_title=new_album_title,
+            category=category,
+            age_stage=age_stage,
+        )
+    elif series_id:
+        async with get_db() as conn:
+            cur_s = await conn.execute("SELECT * FROM media_series WHERE id = ?", (series_id,))
+            srow = await cur_s.fetchone()
+            if not srow:
+                raise ValueError("目标歌手/合集系列不存在")
+            cur_max = await conn.execute("SELECT COALESCE(MAX(season_num), 0) FROM media_albums WHERE series_id = ?", (series_id,))
+            nxt = int((await cur_max.fetchone())[0] or 0) + 1
+            _, alb_obj = await ensure_series_and_season(
+                channel=srow["channel"],
+                series_title=srow["title"],
+                season_num=nxt if season_label.strip() else 1,
+                season_label=season_label.strip() or "精选辑",
+            )
+            target_aid = int(alb_obj["id"])
+            target_title = str(alb_obj["title"])
+    elif new_series_title.strip():
+        _, alb_obj = await ensure_series_and_season(
+            channel=category,
+            series_title=new_series_title.strip(),
+            season_num=1,
+            season_label=season_label.strip() or "精选辑",
+        )
+        target_aid = int(alb_obj["id"])
+        target_title = str(alb_obj["title"])
+    else:
+        target_aid, target_title = await _ensure_batch_target_album(
+            album_id=None,
+            new_album_title=new_album_title,
+            category=category,
+            age_stage=age_stage,
+        )
     ts = now_iso()
     async with get_db() as conn:
         cur = await conn.execute(
@@ -678,7 +737,9 @@ async def enqueue_cloud_batch_download(
         job_id = int(cur.lastrowid)
         await conn.commit()
 
-    task = asyncio.create_task(_run_batch_download_job(job_id, target_aid, target_title, list(songs), base_url))
+    task = asyncio.create_task(
+        _run_batch_download_job(job_id, target_aid, target_title, list(songs), base_url, auto_group_by_artist=auto_group_by_artist)
+    )
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
 
@@ -687,5 +748,6 @@ async def enqueue_cloud_batch_download(
         "album_id": target_aid,
         "album_title": target_title,
         "total_requested": len(songs),
+        "auto_group_by_artist": auto_group_by_artist,
         "status": "running",
     }

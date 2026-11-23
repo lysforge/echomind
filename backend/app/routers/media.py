@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import json
 import re
+import shutil
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -14,7 +16,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.auth import get_current_user, require_admin
-from app.config import load_settings
+from app.config import DATA_DIR, MEDIA_RAW_DIR, MEDIA_TRACKS_DIR, load_settings
 from app.db import ENGLISH_LEVEL_TO_STAGE, ENGLISH_STAGE_TO_LEVEL, _default_channel_emoji, _default_season_label, get_db, now_iso
 from app.gateways.manager import device_manager
 from app.services.ai_curator import (
@@ -22,6 +24,8 @@ from app.services.ai_curator import (
     ensure_series_and_season,
     update_playback_progress,
 )
+from app.services.tts_asr import TTS_CACHE_DIR
+from app.services.webdav_sync import preview_webdav_directory, sync_webdav_mount
 from app.services.collector import (
     LIVE_STREAM_SESSIONS,
     _looks_like_direct_audio_url,
@@ -136,6 +140,24 @@ class TextTrackCreate(BaseModel):
 class ProgressUpdate(BaseModel):
     track_id: int
     position_sec: float = 0.0
+    member_key: str = ""
+
+
+class WebDavMountCreate(BaseModel):
+    name: str
+    base_url: str
+    username: str = ""
+    password: str = ""
+    remote_path: str = "/"
+    channel: Literal["music", "story", "english", "podcast"] = "story"
+    level_code: str = ""
+
+
+class WebDavPreviewRequest(BaseModel):
+    base_url: str
+    remote_path: str = "/"
+    username: str = ""
+    password: str = ""
 
 
 class CastRequest(BaseModel):
@@ -249,9 +271,10 @@ async def list_series_tree(
     channel: str | None = Query(default=None),
     level_code: str | None = Query(default=None),
     q: str | None = Query(default=None),
+    member_key: str | None = Query(default=None),
     _user: dict[str, Any] = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
-    """返回清晰的三级树：一级系列合集 → 二级季/专辑/单元列表 → 三级单集列表及精确断点续播摘要。"""
+    """返回清晰的三级树：一级系列合集 → 二级季/专辑/单元列表 → 三级单集列表及精确断点续播摘要（支持多人独立进度）。"""
     async with get_db() as conn:
         # 兜底确保所有非收件箱专辑都挂在 series 下
         cur_orphan = await conn.execute("SELECT id FROM media_albums WHERE series_id IS NULL AND is_inbox = 0 LIMIT 1")
@@ -285,6 +308,16 @@ async def list_series_tree(
             "SELECT * FROM media_tracks ORDER BY album_id ASC, episode_num ASC, id ASC"
         )
         tracks_raw = [dict(r) for r in await cur_t.fetchall()]
+
+        member_progress: dict[int, dict[str, Any]] = {}
+        mk = (member_key or "").strip()
+        if mk:
+            cur_mp = await conn.execute(
+                "SELECT * FROM user_playback_progress WHERE member_key = ?",
+                (mk,),
+            )
+            for mr in await cur_mp.fetchall():
+                member_progress[int(mr["series_id"])] = dict(mr)
 
     tracks_by_album: dict[int, list[dict[str, Any]]] = {}
     tracks_by_id: dict[int, dict[str, Any]] = {}
@@ -320,10 +353,20 @@ async def list_series_tree(
             if not (hit_s or hit_sea or hit_tr):
                 continue
 
-        # 精确构造断点续播信息
+        # 精确构造断点续播信息（若传入 member_key 则严格按该成员的独立进度返回）
         resume_info: dict[str, Any] | None = None
-        last_tid = s.get("last_track_id")
-        last_aid = s.get("last_album_id")
+        mp = member_progress.get(sid)
+        if mk:
+            last_tid = mp.get("track_id") if mp else None
+            last_aid = mp.get("album_id") if mp else None
+            saved_pos = float(mp.get("position_sec") or 0.0) if mp else 0.0
+            saved_at = mp.get("updated_at") if mp else None
+        else:
+            last_tid = s.get("last_track_id")
+            last_aid = s.get("last_album_id")
+            saved_pos = float(s.get("last_position_sec") or 0.0)
+            saved_at = s.get("last_played_at")
+
         if last_tid and int(last_tid) in tracks_by_id:
             tr = tracks_by_id[int(last_tid)]
             alb = albums_by_id.get(int(tr["album_id"])) or (albums_by_id.get(int(last_aid)) if last_aid else None)
@@ -335,11 +378,11 @@ async def list_series_tree(
                     "track_id": tr["id"],
                     "track_title": tr["title"],
                     "episode_num": int(tr.get("episode_num") or 1),
-                    "position_sec": float(s.get("last_position_sec") or tr.get("last_position_sec") or 0.0),
-                    "last_played_at": s.get("last_played_at") or tr.get("last_played_at"),
+                    "position_sec": saved_pos if saved_pos > 0 else float(tr.get("last_position_sec") or 0.0),
+                    "last_played_at": saved_at or tr.get("last_played_at"),
                 }
-        elif seasons:
-            # 兜底看季里的播放记录
+        elif not mk and seasons:
+            # 兜底看季里的全局播放记录
             for sea in seasons:
                 if sea.get("last_track_id") and int(sea["last_track_id"]) in tracks_by_id:
                     tr = tracks_by_id[int(sea["last_track_id"])]
@@ -835,9 +878,16 @@ async def delete_track(
 async def save_album_progress(
     album_id: int,
     req: ProgressUpdate,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
-    res = await update_playback_progress(album_id=album_id, track_id=req.track_id, position_sec=req.position_sec, increment_play=False)
+    mk = req.member_key.strip() or f"user:{user['id']}"
+    res = await update_playback_progress(
+        album_id=album_id,
+        track_id=req.track_id,
+        position_sec=req.position_sec,
+        increment_play=False,
+        member_key=mk,
+    )
     return {"status": "saved", **res}
 
 
@@ -1390,3 +1440,210 @@ async def collect_upload(
     if len(content) < 256:
         raise HTTPException(status_code=400, detail="上传音频为空或已损坏")
     return await ingest_uploaded_file(album_id, file.filename or "audio.mp3", content)
+
+
+# -------------------- WebDAV / 网盘挂载与三级同步 --------------------
+
+
+@router.get("/webdav-mounts")
+async def list_webdav_mounts(_user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
+    async with get_db() as conn:
+        cur = await conn.execute("SELECT * FROM webdav_mounts ORDER BY id DESC")
+        rows = []
+        for r in await cur.fetchall():
+            d = dict(r)
+            d["has_password"] = bool(d.get("password"))
+            d["password"] = "******" if d.get("password") else ""
+            rows.append(d)
+        return rows
+
+
+@router.post("/webdav-mounts/preview")
+async def preview_webdav_mount_endpoint(
+    req: WebDavPreviewRequest,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    if not req.base_url.strip().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="请输入合法的 http/https WebDAV 地址")
+    try:
+        items = await preview_webdav_directory(req.base_url, req.remote_path, req.username, req.password)
+        return {"entries": items, "count": len(items)}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"连接 WebDAV 失败：{exc}")
+
+
+@router.post("/webdav-mounts")
+async def create_webdav_mount(
+    req: WebDavMountCreate,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    if not req.name.strip() or not req.base_url.strip().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="请填写名称与合法的 WebDAV 地址")
+    ts = now_iso()
+    async with get_db() as conn:
+        try:
+            cur = await conn.execute(
+                """
+                INSERT INTO webdav_mounts (name, base_url, username, password, remote_path, channel, level_code, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    req.name.strip(),
+                    req.base_url.strip(),
+                    req.username.strip(),
+                    req.password,
+                    req.remote_path.strip() or "/",
+                    req.channel,
+                    req.level_code.strip(),
+                    ts,
+                ),
+            )
+            await conn.commit()
+            cur2 = await conn.execute("SELECT * FROM webdav_mounts WHERE id = ?", (cur.lastrowid,))
+            d = dict(await cur2.fetchone())
+            d["password"] = "******" if d.get("password") else ""
+            return d
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"创建 WebDAV 挂载失败: {exc}")
+
+
+@router.delete("/webdav-mounts/{mount_id}")
+async def delete_webdav_mount(
+    mount_id: int,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, str]:
+    async with get_db() as conn:
+        await conn.execute("DELETE FROM webdav_mounts WHERE id = ?", (mount_id,))
+        await conn.commit()
+    return {"status": "deleted"}
+
+
+@router.post("/webdav-mounts/{mount_id}/sync")
+async def sync_webdav_mount_endpoint(
+    mount_id: int,
+    max_files: int = Query(default=80, ge=1, le=300),
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    try:
+        return await sync_webdav_mount(mount_id, max_files=max_files)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"WebDAV 同步失败：{exc}")
+
+
+# -------------------- 服务器磁盘空间与存储清理运维 --------------------
+
+
+def _dir_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    for p in path.rglob("*"):
+        if p.is_file():
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+@router.get("/storage")
+async def get_storage_overview(_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    """返回云服务器磁盘剩余容量、音频库占用、各系列空间排行与缓存可清理量。"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(str(DATA_DIR))
+    tracks_bytes = _dir_size_bytes(MEDIA_TRACKS_DIR)
+    raw_bytes = _dir_size_bytes(MEDIA_RAW_DIR)
+    tts_bytes = _dir_size_bytes(TTS_CACHE_DIR)
+
+    async with get_db() as conn:
+        cur = await conn.execute(
+            """
+            SELECT s.id AS series_id, s.title AS series_title, s.channel, s.cover_emoji,
+                   t.id AS track_id, t.file_path, t.title AS track_title
+            FROM media_series s
+            LEFT JOIN media_albums a ON a.series_id = s.id
+            LEFT JOIN media_tracks t ON t.album_id = a.id
+            """
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+
+    series_stats: dict[int, dict[str, Any]] = {}
+    channel_bytes: dict[str, int] = {"story": 0, "music": 0, "english": 0, "podcast": 0}
+    seen_titles: set[str] = set()
+    duplicate_count = 0
+
+    for r in rows:
+        sid = int(r["series_id"])
+        st = series_stats.setdefault(
+            sid,
+            {
+                "series_id": sid,
+                "title": r["series_title"],
+                "channel": r["channel"],
+                "cover_emoji": r.get("cover_emoji") or "",
+                "track_count": 0,
+                "bytes": 0,
+            },
+        )
+        if r.get("track_id"):
+            st["track_count"] += 1
+            fp = Path(r["file_path"]) if r.get("file_path") else None
+            sz = fp.stat().st_size if (fp and fp.exists()) else 0
+            st["bytes"] += sz
+            channel_bytes[r["channel"]] = channel_bytes.get(r["channel"], 0) + sz
+            tkey = f"{sid}:{str(r.get('track_title') or '').strip().lower()}"
+            if tkey in seen_titles:
+                duplicate_count += 1
+            seen_titles.add(tkey)
+
+    series_ranked = sorted(series_stats.values(), key=lambda x: x["bytes"], reverse=True)
+    for item in series_ranked:
+        item["size_mb"] = round(item["bytes"] / (1024 * 1024), 2)
+
+    return {
+        "data_dir": str(DATA_DIR),
+        "disk_total_gb": round(usage.total / (1024**3), 2),
+        "disk_used_gb": round(usage.used / (1024**3), 2),
+        "disk_free_gb": round(usage.free / (1024**3), 2),
+        "disk_used_pct": round((usage.used / usage.total) * 100, 1) if usage.total else 0.0,
+        "media_tracks_mb": round(tracks_bytes / (1024 * 1024), 2),
+        "raw_cache_mb": round(raw_bytes / (1024 * 1024), 2),
+        "tts_cache_mb": round(tts_bytes / (1024 * 1024), 2),
+        "duplicate_track_count": duplicate_count,
+        "channel_usage_mb": {k: round(v / (1024 * 1024), 2) for k, v in channel_bytes.items()},
+        "series_usage": series_ranked[:50],
+    }
+
+
+@router.post("/storage/clean-cache")
+async def clean_storage_caches(
+    _admin: dict[str, Any] = Depends(require_admin),
+) -> dict[str, Any]:
+    """一键清理临时下载残留文件与超过 6 小时的 TTS 语音缓存，绝不删除任何已入库正式音频。"""
+    freed = 0
+    removed_files = 0
+    cutoff = time.time() - 6 * 3600
+
+    for root_dir, check_age in ((MEDIA_RAW_DIR, False), (TTS_CACHE_DIR, True)):
+        if not root_dir.exists():
+            continue
+        for p in list(root_dir.rglob("*")):
+            if not p.is_file():
+                continue
+            try:
+                if check_age and p.stat().st_mtime > cutoff:
+                    continue
+                sz = p.stat().st_size
+                p.unlink(missing_ok=True)
+                freed += sz
+                removed_files += 1
+            except OSError:
+                pass
+
+    return {
+        "status": "cleaned",
+        "removed_files": removed_files,
+        "freed_mb": round(freed / (1024 * 1024), 2),
+    }

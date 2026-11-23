@@ -67,6 +67,10 @@ async def speaker_ws_endpoint(websocket: WebSocket) -> None:
             if msg_type == "track_ended":
                 await device_manager.advance_device_queue(device_id, delta=1, auto_triggered=True)
                 continue
+            if msg_type == "progress_report":
+                pos = float(msg.get("position_sec") or 0.0)
+                await device_manager.report_hardware_progress(device_id, pos)
+                continue
 
             audio_bytes = None
             if msg.get("audio_base64"):

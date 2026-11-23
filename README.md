@@ -106,9 +106,12 @@ docker run -d --name echomind-music-dl -p 127.0.0.1:18080:8080 guohuiyuan/go-mus
 
 ## 智能音箱与硬件接入
 
-- **普通音箱 / 树莓派 / Mac 桥接**：在后台添加音箱后可下载专属 `clients/echomind_xiaoai_agent.py` 脚本，连入 `/ws/speaker` 接收整张专辑连播队列，并在每首歌播放结束自动触发下一首。
-- **6 位配对码零配置认领**：陌生设备直连 `/ws/speaker` 会自动进入待认领池并生成 6 位配对码。
-- **ESP32 小智开源语音硬件**：内置 `/xiaozhi/ota/` 与 `/xiaozhi/v1/` WebSocket 协议支持。
+- **小米小爱音箱真机直连（免刷机）**：内置基于 `miservice-fork` 的小爱云端直连引擎，在「音箱与设置 → 小爱真机与小智MCP」登录小米账号即可自动发现家里所有小爱音箱一键绑定，支持直接推送音频流、播完自动跨季连播、采集完成主动开口播报（播报完自动恢复原故事）、护耳音量硬限幅，以及开启语音指令自动接管。
+- **ESP32 小智开源语音硬件 & 标准 MCP Server**：
+  - 支持直接把小智 OTA 指向 `/xiaozhi/ota/` 享受原生 `/xiaozhi/v1/` Opus 断点续播与跨季自动连播；
+  - 同时内置标准 JSON-RPC 2.0 **MCP Server（`POST /api/mcp`）**，可直接挂载到已有的 `xiaozhi-esp32-server` 或任意 MCP Agent 中调用点播、跳季跳集、语音采集分类与房间推送工具。
+- **通用音箱 / 树莓派 / Mac 桥接**：下载专属 `clients/echomind_xiaoai_agent.py` 脚本连入 `/ws/speaker`，原生支持 `start_position_sec` 断点跳转、每 5 秒 `progress_report` 精确秒数上报与通知播报后自动恢复原音频。
+- **网盘 WebDAV / 本地三级目录与存储运维**：支持 OpenList / AList / NAS WebDAV 一键按 `系列/第X季/单集.mp3` 同步建树、本地目录扫描与 `mutagen` ID3 自动按「歌手 → 专辑」归档、云服务器磁盘空间监控与缓存清理，以及手机 PWA 锁屏控制（MediaSession）。
 
 ---
 

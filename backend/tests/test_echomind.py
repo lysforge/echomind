@@ -911,4 +911,266 @@ def test_series_three_level_resume_cross_season_voice_collect_and_english_ladder
         assert pron.json()["tts_url"].startswith("/api/tts-cache/")
 
 
+def test_xiaoai_cloud_mcp_webdav_multimember_progress_voice_ops_and_storage(monkeypatch):
+    """深度全链路验证：真小爱桥接、标准MCP Server、WebDAV三级同步、两级本地目录扫描、多人独立进度、新语音口令、英语打卡跟读与磁盘运维。"""
+    import http.server
+    import threading
+    from app.services import ai_curator
+    from app.services.xiaoai_bridge import xiaoai_bridge
+
+    wav_bytes = _make_synthetic_voice_wav(f0_hz=380.0, duration_sec=0.8)
+
+    # 1. 搭建本机轻量模拟 WebDAV 服务器（含 故事系列/第2季/01_探险.wav 两级目录）
+    class MockWebDavHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return
+
+        def do_PROPFIND(self):
+            clen = int(self.headers.get("Content-Length") or 0)
+            if clen > 0:
+                _ = self.rfile.read(clen)
+            from urllib.parse import unquote
+            p = unquote(self.path).rstrip("/") or "/"
+            if p == "/dav":
+                xml_doc = """<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response><D:href>/dav/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>
+  <D:response><D:href>/dav/%E6%B5%B7%E5%BA%95%E5%B0%8F%E7%BA%B5%E9%98%9F/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>
+</D:multistatus>"""
+            elif p.endswith("海底小纵队"):
+                xml_doc = """<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response><D:href>/dav/%E6%B5%B7%E5%BA%95%E5%B0%8F%E7%BA%B5%E9%98%9F/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>
+  <D:response><D:href>/dav/%E6%B5%B7%E5%BA%95%E5%B0%8F%E7%BA%B5%E9%98%9F/%E7%AC%AC3%E5%AD%A3/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>
+</D:multistatus>"""
+            else:
+                xml_doc = """<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response><D:href>/dav/%E6%B5%B7%E5%BA%95%E5%B0%8F%E7%BA%B5%E9%98%9F/%E7%AC%AC3%E5%AD%A3/</D:href><D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat></D:response>
+  <D:response><D:href>/dav/%E6%B5%B7%E5%BA%95%E5%B0%8F%E7%BA%B5%E9%98%9F/%E7%AC%AC3%E5%AD%A3/%E7%AC%AC2%E9%9B%86_%E6%B7%B1%E6%B5%B7%E6%95%91%E6%8F%B4.wav</D:href><D:propstat><D:prop><D:resourcetype/><D:getcontentlength>10240</D:getcontentlength></D:prop></D:propstat></D:response>
+</D:multistatus>"""
+            raw = xml_doc.encode("utf-8")
+            self.send_response(207)
+            self.send_header("Content-Type", "application/xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(wav_bytes)))
+            self.end_headers()
+            self.wfile.write(wav_bytes)
+
+    wd_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockWebDavHandler)
+    threading.Thread(target=wd_server.serve_forever, daemon=True).start()
+    wd_base = f"http://127.0.0.1:{wd_server.server_address[1]}/dav"
+
+    # 2. 模拟小米 MiNAService 验证真小爱发现/绑定/推送/播报/音量护耳
+    mi_calls: list[tuple[str, Any]] = []
+
+    class FakeMiNA:
+        async def device_list(self, master=0):
+            return [
+                {"deviceID": "mi_dev_001", "miotDID": "miot_99", "alias": "客厅小爱Pro", "hardware": "LX06", "mac": "AA:BB:CC", "presence": "online"}
+            ]
+
+        async def play_by_music_url(self, deviceId, url, _type=2):
+            mi_calls.append(("play_url", (deviceId, url)))
+            return {"code": 0}
+
+        async def play_by_url(self, deviceId, url, _type=2):
+            mi_calls.append(("play_url", (deviceId, url)))
+            return {"code": 0}
+
+        async def text_to_speech(self, deviceId, text):
+            mi_calls.append(("tts", (deviceId, text)))
+            return {"code": 0}
+
+        async def player_set_volume(self, deviceId, volume):
+            mi_calls.append(("volume", (deviceId, volume)))
+            return {"code": 0}
+
+        async def player_pause(self, deviceId):
+            mi_calls.append(("pause", deviceId))
+            return {"code": 0}
+
+        async def player_stop(self, deviceId):
+            mi_calls.append(("stop", deviceId))
+            return {"code": 0}
+
+    async def _fake_ensure_mina(mi_user=None, mi_pass=None):
+        return FakeMiNA()
+
+    monkeypatch.setattr(xiaoai_bridge, "_ensure_mina", _fake_ensure_mina)
+
+    try:
+        with TestClient(app) as client:
+            hdr = {"Authorization": f"Bearer {client.post('/api/auth/login', json={'username': 'boss', 'password': 'pass1234'}).json()['token']}"}
+
+            # A. 故事候选噪声过滤验证
+            filtered = ai_curator.filter_and_rank_candidates(
+                [
+                    {"title": "【汪汪队第2季Reaction】主播反应解说", "url": "https://a/1"},
+                    {"title": "汪汪队立大功全集 睡前故事音频", "url": "https://a/2"},
+                ],
+                "story",
+            )
+            assert filtered[0]["url"] == "https://a/2"
+
+            # B. 真·小米小爱音箱发现 -> 绑定 -> 推送音频 -> 音量护耳限幅 -> 语音播报
+            disc = client.post(
+                "/api/devices/xiaoai/discover",
+                headers=hdr,
+                json={"mi_user": "13800001111", "mi_pass": "secret123", "public_base_url": "http://192.168.1.9:8090"},
+            )
+            assert disc.status_code == 200
+            assert disc.json()["count"] == 1
+            mi_dev = disc.json()["devices"][0]
+
+            bound = client.post(
+                "/api/devices/xiaoai/bind",
+                headers=hdr,
+                json={
+                    "mi_device_id": mi_dev["mi_device_id"],
+                    "miot_did": mi_dev["miot_did"],
+                    "name": mi_dev["name"],
+                    "hardware": mi_dev["hardware"],
+                    "room": "客厅",
+                    "max_volume": 65,
+                },
+            )
+            assert bound.status_code == 200
+            xiaoai_dev_id = bound.json()["id"]
+
+            # 调音量到 90 -> 被护耳上限夹到 65 并下发真小爱
+            assert client.post("/api/interact", headers=hdr, json={"text": "音量调到90", "device_id": xiaoai_dev_id}).status_code == 200
+            assert ("volume", ("mi_dev_001", 65)) in mi_calls
+
+            # C. WebDAV 预览 + 挂载 + 递归三级树同步（海底小纵队 -> 第3季 -> 第2集）
+            prev_wd = client.post("/api/media/webdav-mounts/preview", headers=hdr, json={"base_url": wd_base, "remote_path": "/"})
+            assert prev_wd.status_code == 200, prev_wd.text
+            assert prev_wd.json()["count"] == 1
+
+            m_wd = client.post(
+                "/api/media/webdav-mounts",
+                headers=hdr,
+                json={"name": "家庭故事网盘", "base_url": wd_base, "remote_path": "/", "channel": "story"},
+            )
+            assert m_wd.status_code == 200
+            mount_id = m_wd.json()["id"]
+            sync_wd = client.post(f"/api/media/webdav-mounts/{mount_id}/sync", headers=hdr)
+            assert sync_wd.status_code == 200, sync_wd.text
+            assert sync_wd.json()["tracks_added"] == 1
+
+            story_tree = client.get("/api/media/series?channel=story", headers=hdr).json()
+            octo = next((s for s in story_tree if s["title"] == "海底小纵队"), None)
+            assert octo is not None
+            assert octo["seasons"][0]["season_num"] == 3
+            assert octo["seasons"][0]["tracks"][0]["episode_num"] == 2
+
+            # D. 本地两级子目录自动三级树扫描（恐龙战队/第2季/第3集_出发.wav）
+            with tempfile.TemporaryDirectory(prefix="echomind_tree_scan_") as scan_dir:
+                sub = Path(scan_dir) / "恐龙战队" / "第2季"
+                sub.mkdir(parents=True, exist_ok=True)
+                (sub / "第3集_霸王龙出发.wav").write_bytes(wav_bytes)
+                lf = client.post(
+                    "/api/media/local-folders",
+                    headers=hdr,
+                    json={"name": "本地三维故事盘", "folder_path": scan_dir, "media_type": "story", "age_stage": "S6_ALL"},
+                )
+                assert lf.status_code == 200
+                sc = client.post(f"/api/media/local-folders/{lf.json()['id']}/scan", headers=hdr)
+                assert sc.status_code == 200
+                assert sc.json()["tracks_added"] == 1
+            story_tree2 = client.get("/api/media/series?channel=story", headers=hdr).json()
+            dino = next((s for s in story_tree2 if s["title"] == "恐龙战队"), None)
+            assert dino is not None
+            assert dino["seasons"][0]["season_num"] == 2
+            assert dino["seasons"][0]["tracks"][0]["episode_num"] == 3
+
+            # E. 多人独立播放进度隔离（大宝 vs 二宝对《汪汪队》互不覆盖）
+            paw = next((s for s in story_tree2 if s["title"] == "汪汪队"), None)
+            assert paw is not None
+            s1_alb, s2_alb = paw["seasons"][0], paw["seasons"][1]
+            assert client.post(
+                f"/api/media/albums/{s1_alb['id']}/progress",
+                headers=hdr,
+                json={"track_id": s1_alb["tracks"][0]["id"], "position_sec": 18.5, "member_key": "member:101"},
+            ).status_code == 200
+            assert client.post(
+                f"/api/media/albums/{s2_alb['id']}/progress",
+                headers=hdr,
+                json={"track_id": s2_alb["tracks"][1]["id"], "position_sec": 55.0, "member_key": "member:102"},
+            ).status_code == 200
+
+            t101 = next(s for s in client.get("/api/media/series?channel=story&member_key=member:101", headers=hdr).json() if s["title"] == "汪汪队")
+            t102 = next(s for s in client.get("/api/media/series?channel=story&member_key=member:102", headers=hdr).json() if s["title"] == "汪汪队")
+            assert t101["resume_info"]["season_num"] == 1 and abs(t101["resume_info"]["position_sec"] - 18.5) < 0.1
+            assert t102["resume_info"]["season_num"] == 2 and abs(t102["resume_info"]["position_sec"] - 55.0) < 0.1
+
+            # F. 新增高频语音口令（汪汪队有几季 / 重播 / 快进30秒 / 单曲循环 / 现在放的是什么）+ 推送到真小爱验证
+            q_info = client.post("/api/interact", headers=hdr, json={"text": "汪汪队有几季"}).json()
+            assert "2 季" in q_info["reply_text"] and "4 集" in q_info["reply_text"]
+
+            push_mi = client.post(
+                "/api/playback/push",
+                headers=hdr,
+                json={"device_ids": [xiaoai_dev_id], "series_id": paw["id"], "resume": True},
+            )
+            assert push_mi.status_code == 200
+            assert any(op == "play_url" and payload[0] == "mi_dev_001" for op, payload in mi_calls)
+
+            r_what = client.post("/api/interact", headers=hdr, json={"text": "现在放的是什么", "device_id": xiaoai_dev_id}).json()
+            assert "汪汪队" in r_what["reply_text"]
+            r_seek = client.post("/api/interact", headers=hdr, json={"text": "快进30秒", "device_id": xiaoai_dev_id}).json()
+            assert r_seek["control_action"]["action"] == "seek_delta" and r_seek["control_action"]["delta_sec"] == 30
+            r_rep = client.post("/api/interact", headers=hdr, json={"text": "重播这集", "device_id": xiaoai_dev_id}).json()
+            assert r_rep["control_action"]["action"] == "replay"
+            r_loop = client.post("/api/interact", headers=hdr, json={"text": "单曲循环", "device_id": xiaoai_dev_id}).json()
+            assert r_loop["control_action"]["loop_mode"] == "repeat_one"
+
+            # G. 标准 MCP Server JSON-RPC 2.0 端到端验证（供 xiaozhi-esp32-server 接入）
+            mcp_list = client.post("/api/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+            assert mcp_list.status_code == 200
+            tool_names = [t["name"] for t in mcp_list.json()["result"]["tools"]]
+            assert "echomind_play_series" in tool_names and "echomind_collect_and_classify" in tool_names
+
+            mcp_call = client.post(
+                "/api/mcp",
+                json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "echomind_list_library", "arguments": {"channel": "story"}}},
+            )
+            assert mcp_call.status_code == 200
+            assert mcp_call.json()["result"]["structuredContent"]["count"] >= 3
+
+            # H. 英语启蒙 7 天打卡日历与跟读录音打星
+            chk = client.post("/api/english/checkin", headers=hdr, json={"duration_min": 8.0, "spoken_score": 5, "member_key": "member:101"})
+            assert chk.status_code == 200
+            assert chk.json()["streak_days"] >= 1 and chk.json()["today_checked"] is True
+            assert len(chk.json()["last_7_days"]) == 7
+
+            ev = client.post(
+                "/api/english/evaluate-speech",
+                headers=hdr,
+                data={"expected_text": "Good morning!", "member_key": "member:101"},
+                files={"file": ("read.wav", wav_bytes, "audio/wav")},
+            )
+            assert ev.status_code == 200
+            assert ev.json()["stars"] >= 4
+
+            # I. 服务器磁盘空间运维监控与缓存清理
+            st_r = client.get("/api/media/storage", headers=hdr)
+            assert st_r.status_code == 200
+            st_data = st_r.json()
+            assert st_data["disk_total_gb"] > 0 and len(st_data["series_usage"]) >= 3
+
+            cln = client.post("/api/media/storage/clean-cache", headers=hdr)
+            assert cln.status_code == 200 and cln.json()["status"] == "cleaned"
+    finally:
+        wd_server.shutdown()
+        wd_server.server_close()
+
+
+
 

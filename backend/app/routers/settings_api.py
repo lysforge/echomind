@@ -38,8 +38,14 @@ class SettingsUpdate(BaseModel):
     quiet_hours_end: str | None = None
     quiet_hours_force_active: bool | None = None
     loudnorm_target_lufs: float | None = None
+    public_base_url: str | None = None
     music_dl_url: str | None = None
     music_dl_sources: str | None = None
+    mi_user: str | None = None
+    mi_pass: str | None = None
+    mi_poll_enabled: bool | None = None
+    mi_poll_interval_sec: float | None = None
+    mi_trigger_keywords: str | None = None
 
 
 class TestLLMRequest(BaseModel):
@@ -80,14 +86,23 @@ def _public_settings_payload() -> dict[str, Any]:
         "quiet_hours_end": s.quiet_hours_end,
         "quiet_hours_force_active": s.quiet_hours_force_active,
         "loudnorm_target_lufs": s.loudnorm_target_lufs,
+        "public_base_url": s.public_base_url,
+        "resolved_public_base_url": (s.public_base_url or f"http://{lan_ip}:{s.server_port}").rstrip("/"),
         "music_dl_url": s.music_dl_url,
         "music_dl_sources": s.music_dl_sources,
+        "mi_user": s.mi_user,
+        "has_mi_pass": bool(s.mi_pass.strip()),
+        "mi_pass_masked": mask_secret(s.mi_pass),
+        "mi_poll_enabled": s.mi_poll_enabled,
+        "mi_poll_interval_sec": s.mi_poll_interval_sec,
+        "mi_trigger_keywords": s.mi_trigger_keywords,
         "hardware_endpoints": {
             "lan_ip": lan_ip,
             "port": s.server_port,
             "speaker_ws_url": f"ws://{lan_ip}:{s.server_port}/ws/speaker",
             "robot_ota_url": f"http://{lan_ip}:{s.server_port}/xiaozhi/ota/",
             "robot_ws_url": f"ws://{lan_ip}:{s.server_port}/xiaozhi/v1/",
+            "mcp_url": f"http://{lan_ip}:{s.server_port}/api/mcp",
         },
     }
 
@@ -105,7 +120,7 @@ async def update_settings(
     s = load_settings()
     data = req.model_dump(exclude_none=True)
 
-    for key in ("llm_api_key", "asr_api_key"):
+    for key in ("llm_api_key", "asr_api_key", "mi_pass"):
         if key in data:
             val = data[key].strip()
             if val == "__CLEAR__":

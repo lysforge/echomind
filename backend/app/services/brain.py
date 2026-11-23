@@ -366,6 +366,38 @@ def extract_playback_control_intent(text: str) -> dict[str, Any] | None:
         if ep_val:
             return {"action": "jump_episode", "episode_num": ep_val}
 
+    # 3.5 重播 / 快进快退 / 循环模式 / 当前播放与书库查询
+    if any(k in t for k in ("重播", "再放一遍", "重新播放这", "再听一遍", "从头放这")):
+        return {"action": "replay"}
+
+    m_seek = re.search(r"(快进|前进|往前跳|快退|倒退|后退|往回退)\s*([一二两三四五六七八九十\d]+)\s*(秒|分钟|分)", t)
+    if m_seek:
+        direction = -1 if m_seek.group(1) in ("快退", "倒退", "后退", "往回退") else 1
+        num = parse_cn_number(m_seek.group(2)) or 15
+        unit = m_seek.group(3)
+        sec = num * 60 if unit in ("分", "分钟") else num
+        return {"action": "seek_delta", "delta_sec": direction * sec}
+    if any(k in t for k in ("快进一点", "快进一下")):
+        return {"action": "seek_delta", "delta_sec": 15}
+    if any(k in t for k in ("快退一点", "倒退一点", "退回一点")):
+        return {"action": "seek_delta", "delta_sec": -15}
+
+    if "单曲循环" in t or "单集循环" in t:
+        return {"action": "set_loop", "loop_mode": "repeat_one"}
+    if "随机播放" in t or "随便播" in t:
+        return {"action": "set_loop", "loop_mode": "shuffle"}
+    if "顺序播放" in t or "顺序循环" in t or "列表循环" in t:
+        return {"action": "set_loop", "loop_mode": "sequential"}
+
+    if any(k in t for k in ("现在放的是什么", "正在放什么", "这是什么歌", "这是什么故事", "这是第几集", "在放什么")):
+        return {"action": "whats_playing"}
+
+    m_qseries = re.search(r"^(.+?)(?:一共有|共有|有)(?:几季|多少季|几集|多少集|几首|多少首)", t)
+    if m_qseries:
+        kw_s = re.sub(r"^(?:请问|帮我查一下|查一下|看看)", "", m_qseries.group(1)).strip(" 的")
+        if kw_s:
+            return {"action": "query_series_info", "keyword": kw_s}
+
     # 4. 暂停 / 停止 / 续播 / 上下集
     if t in ("暂停", "暂停播放", "停一下", "先暂停", "帮我暂停") or "暂停播放" in t:
         return {"action": "pause"}
@@ -418,6 +450,105 @@ async def _execute_playback_control(ctrl: dict[str, Any], device_id: str, speake
             if r:
                 is_real_dev = True
                 dev_row = dict(r)
+
+    if act == "replay":
+        if is_real_dev and device_manager.playback_sessions.get(device_id):
+            snap = await device_manager.control_device_queue(device_id, "replay")
+            cur_t = (snap.get("session") or {}).get("current_track")
+            return BrainResponse(
+                reply_text=f"好的，为您从头重播《{cur_t['title']}》。" if cur_t else "好的，为您重播本集。",
+                play_track=cur_t,
+                control_action={"action": "replay"},
+                memory_scope_used=scopes,
+                skip_device_push=True,
+            )
+        return BrainResponse(reply_text="好的，为您从头重播当前音频。", control_action={"action": "replay"}, memory_scope_used=scopes)
+
+    if act == "seek_delta":
+        dsec = int(ctrl.get("delta_sec") or 15)
+        verb = f"快进 {dsec} 秒" if dsec > 0 else f"倒退 {abs(dsec)} 秒"
+        if is_real_dev and device_manager.playback_sessions.get(device_id):
+            await device_manager.control_device_queue(device_id, "seek_delta", delta_sec=float(dsec))
+        return BrainResponse(
+            reply_text=f"好的，已为您{verb}。",
+            control_action={"action": "seek_delta", "delta_sec": dsec},
+            memory_scope_used=scopes,
+            skip_device_push=True,
+        )
+
+    if act == "set_loop":
+        lmode = str(ctrl.get("loop_mode") or "sequential")
+        lmap = {"repeat_one": "单曲循环", "shuffle": "随机播放", "sequential": "顺序连播"}
+        if is_real_dev and device_manager.playback_sessions.get(device_id):
+            await device_manager.control_device_queue(device_id, "set_loop", loop_mode=lmode)
+        return BrainResponse(
+            reply_text=f"好的，播放模式已切换为{lmap.get(lmode, '顺序连播')}。",
+            control_action={"action": "set_loop", "loop_mode": lmode},
+            memory_scope_used=scopes,
+        )
+
+    if act == "whats_playing":
+        sess = device_manager.playback_sessions.get(device_id) if is_real_dev else None
+        if sess and sess.get("queue"):
+            idx = int(sess.get("current_index") or 0)
+            tr = sess["queue"][idx] if 0 <= idx < len(sess["queue"]) else None
+            if tr:
+                sea_lbl = sess.get("season_label") or ""
+                return BrainResponse(
+                    reply_text=f"现在正在播放的是《{sess.get('album_title', '')}》{sea_lbl} 第{tr.get('episode_num', idx + 1)}集：{tr['title']}。",
+                    control_action={"action": "whats_playing"},
+                    memory_scope_used=scopes,
+                )
+        async with get_db() as conn:
+            cur_s = await conn.execute(
+                """
+                SELECT s.title AS stitle, a.season_label, t.episode_num, t.title AS ttitle
+                FROM media_series s
+                JOIN media_albums a ON s.last_album_id = a.id
+                JOIN media_tracks t ON s.last_track_id = t.id
+                ORDER BY COALESCE(s.last_played_at, '') DESC
+                LIMIT 1
+                """
+            )
+            r = await cur_s.fetchone()
+        if r:
+            return BrainResponse(
+                reply_text=f"最近收听的是《{r['stitle']}》{r['season_label']} 第{r['episode_num']}集：{r['ttitle']}。",
+                control_action={"action": "whats_playing"},
+                memory_scope_used=scopes,
+            )
+        return BrainResponse(reply_text="当前暂时没有正在播放的内容哦。", control_action={"action": "whats_playing"}, memory_scope_used=scopes)
+
+    if act == "query_series_info":
+        kw_s = str(ctrl.get("keyword") or "").strip()
+        async with get_db() as conn:
+            cur_s = await conn.execute("SELECT * FROM media_series WHERE title LIKE ? LIMIT 1", (f"%{kw_s}%",))
+            srow = await cur_s.fetchone()
+            if srow:
+                cur_a = await conn.execute(
+                    """
+                    SELECT a.season_num, a.season_label, COUNT(t.id) AS cnt
+                    FROM media_albums a
+                    LEFT JOIN media_tracks t ON t.album_id = a.id
+                    WHERE a.series_id = ?
+                    GROUP BY a.id
+                    ORDER BY a.season_num ASC
+                    """,
+                    (srow["id"],),
+                )
+                seas = [dict(x) for x in await cur_a.fetchall()]
+                total_eps = sum(int(x["cnt"] or 0) for x in seas)
+                detail = "，".join(f"{x['season_label'] or ('第' + str(x['season_num']) + '季')}{x['cnt']}集" for x in seas)
+                return BrainResponse(
+                    reply_text=f"《{srow['title']}》目前收录了 {len(seas)} 季，共 {total_eps} 集（{detail}）。",
+                    control_action={"action": "query_series_info"},
+                    memory_scope_used=scopes,
+                )
+        return BrainResponse(
+            reply_text=f"书架里还没有收录《{kw_s}》，你可以对我说「帮我采集{kw_s}」由我自动上网搜集并分类哦。",
+            control_action={"action": "query_series_info"},
+            memory_scope_used=scopes,
+        )
 
     if act == "volume_set":
         val = int(ctrl["value"])
@@ -703,17 +834,31 @@ async def _pick_from_series(
     season_num: int | None = None,
     episode_num: int | None = None,
     next_episode: bool = False,
+    member_key: str | None = None,
 ) -> dict[str, Any] | None:
-    """在命中的一级系列 media_series 中精准定位季、集、断点秒数并组装整季连播队列。"""
+    """在命中的一级系列 media_series 中精准定位季、集、断点秒数并组装整季连播队列（支持多人独立进度）。"""
     sid = int(series["id"])
+    mem_prog: dict[str, Any] | None = None
     async with get_db() as conn:
         cur = await conn.execute(
             "SELECT * FROM media_albums WHERE series_id = ? AND is_inbox = 0 ORDER BY season_num ASC, id ASC",
             (sid,),
         )
         seasons = [dict(r) for r in await cur.fetchall()]
+        if member_key:
+            cur_mp = await conn.execute(
+                "SELECT * FROM user_playback_progress WHERE member_key = ? AND series_id = ?",
+                (member_key, sid),
+            )
+            mprow = await cur_mp.fetchone()
+            if mprow:
+                mem_prog = dict(mprow)
     if not seasons:
         return None
+
+    eff_last_album_id = (mem_prog or {}).get("album_id") or series.get("last_album_id")
+    eff_last_track_id = (mem_prog or {}).get("track_id") or series.get("last_track_id")
+    eff_last_pos = float((mem_prog or {}).get("position_sec") if mem_prog else (series.get("last_position_sec") or 0.0))
 
     # 1. 指定季号精准定位
     target_season: dict[str, Any] | None = None
@@ -724,8 +869,8 @@ async def _pick_from_series(
     elif episode_num is not None:
         # 只说集号没说季号：先查上次播到的季，找不到再跨季找
         preferred: list[dict[str, Any]] = []
-        if series.get("last_album_id"):
-            la = next((s for s in seasons if s["id"] == series["last_album_id"]), None)
+        if eff_last_album_id:
+            la = next((s for s in seasons if s["id"] == eff_last_album_id), None)
             if la:
                 preferred.append(la)
         preferred.extend([s for s in seasons if s not in preferred])
@@ -748,9 +893,9 @@ async def _pick_from_series(
                     "keyword": series["title"],
                 }
     else:
-        # 既没指定季也没指定集 -> 优先使用系列记忆的上次播放季（断点续播）
-        if series.get("last_album_id"):
-            target_season = next((s for s in seasons if s["id"] == series["last_album_id"]), None)
+        # 既没指定季也没指定集 -> 优先使用该成员/系列记忆的上次播放季（断点续播）
+        if eff_last_album_id:
+            target_season = next((s for s in seasons if s["id"] == eff_last_album_id), None)
 
     # 若还没确定季，取第一个有可播单集的季
     if target_season is None:
@@ -774,7 +919,6 @@ async def _pick_from_series(
         if chosen is None and 1 <= episode_num <= len(tracks):
             chosen = tracks[episode_num - 1]
     elif season_num is not None:
-        # 指定了季但没说集：该季有续播记录就续播，否则从第 1 集开始
         if target_season.get("last_track_id"):
             idx = next((i for i, t in enumerate(tracks) if t["id"] == target_season["last_track_id"]), -1)
             if idx >= 0:
@@ -782,13 +926,12 @@ async def _pick_from_series(
                 start_pos = 0.0 if next_episode else float(target_season.get("last_position_sec") or 0.0)
                 resumed = not next_episode
     else:
-        # 断点续播本系列记忆的季 + 集 + 秒数
-        mem_tid = series.get("last_track_id") or target_season.get("last_track_id")
+        mem_tid = eff_last_track_id or target_season.get("last_track_id")
         if mem_tid:
             idx = next((i for i, t in enumerate(tracks) if t["id"] == mem_tid), -1)
             if idx >= 0:
                 chosen = tracks[(idx + 1) % len(tracks)] if next_episode else tracks[idx]
-                start_pos = 0.0 if next_episode else float(series.get("last_position_sec") or target_season.get("last_position_sec") or 0.0)
+                start_pos = 0.0 if next_episode else (eff_last_pos or float(target_season.get("last_position_sec") or 0.0))
                 resumed = not next_episode
 
     if chosen is None:
@@ -818,6 +961,7 @@ async def resolve_voice_play_request(
     episode_num: int | None = None,
     season_num: int | None = None,
     level_code: str | None = None,
+    member_key: str | None = None,
 ) -> dict[str, Any]:
     """
     核心音频多级查找解析策略：
@@ -867,6 +1011,7 @@ async def resolve_voice_play_request(
             season_num=season_num,
             episode_num=episode_num,
             next_episode=next_episode,
+            member_key=member_key,
         )
         if series_hit:
             return series_hit
@@ -1050,6 +1195,7 @@ async def _execute_tool_call(
         ep_n = parse_cn_number(args.get("episode_num"))
         sea_n = parse_cn_number(args.get("season_num"))
         lvl = args.get("level_code")
+        mk = f"member:{speaker.member_id}" if speaker.member_id else None
         res = await resolve_voice_play_request(
             cat,
             kw,
@@ -1058,6 +1204,7 @@ async def _execute_tool_call(
             episode_num=ep_n,
             season_num=sea_n,
             level_code=lvl,
+            member_key=mk,
         )
         if res.get("type") == "play_track":
             tr = res["track"]
@@ -1068,6 +1215,7 @@ async def _execute_tool_call(
                     track_id=int(tr["id"]),
                     position_sec=keep_pos,
                     increment_play=True,
+                    member_key=mk,
                 )
         return res
 

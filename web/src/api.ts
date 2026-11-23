@@ -395,15 +395,92 @@ export interface SettingsPayload {
   quiet_hours_end: string;
   quiet_hours_force_active: boolean;
   loudnorm_target_lufs: number;
+  public_base_url?: string;
+  resolved_public_base_url?: string;
   music_dl_url: string;
   music_dl_sources: string;
+  mi_user?: string;
+  has_mi_pass?: boolean;
+  mi_pass_masked?: string;
+  mi_poll_enabled?: boolean;
+  mi_poll_interval_sec?: number;
+  mi_trigger_keywords?: string;
   hardware_endpoints: {
     lan_ip: string;
     port: number;
     speaker_ws_url: string;
     robot_ota_url: string;
     robot_ws_url: string;
+    mcp_url?: string;
   };
+}
+
+export interface XiaoAiDiscoveredDevice {
+  mi_device_id: string;
+  miot_did: string;
+  name: string;
+  hardware: string;
+  mac: string;
+  presence: string;
+  online: boolean;
+}
+
+export interface XiaoAiBridgeStatus {
+  library_available: boolean;
+  configured: boolean;
+  poll_enabled: boolean;
+  poll_running: boolean;
+  public_base_url: string;
+  bound_count: number;
+  bound_devices: Array<{ id: string; name: string; room: string; mi_device_id: string; hardware: string }>;
+  recent_asks: Array<{ device_id: string; device_name: string; query: string; handled: boolean; time: string }>;
+  last_error: string;
+}
+
+export interface WebDavMount {
+  id: number;
+  name: string;
+  base_url: string;
+  username: string;
+  password: string;
+  has_password?: boolean;
+  remote_path: string;
+  channel: "music" | "story" | "english" | "podcast";
+  level_code: string;
+  last_synced_at: string | null;
+  last_status: string;
+  tracks_synced: number;
+  created_at: string;
+}
+
+export interface StorageOverview {
+  data_dir: string;
+  disk_total_gb: number;
+  disk_used_gb: number;
+  disk_free_gb: number;
+  disk_used_pct: number;
+  media_tracks_mb: number;
+  raw_cache_mb: number;
+  tts_cache_mb: number;
+  duplicate_track_count: number;
+  channel_usage_mb: Record<string, number>;
+  series_usage: Array<{
+    series_id: number;
+    title: string;
+    channel: string;
+    cover_emoji: string;
+    track_count: number;
+    size_mb: number;
+  }>;
+}
+
+export interface EnglishCheckinStats {
+  member_key: string;
+  streak_days: number;
+  total_checkins: number;
+  total_minutes: number;
+  today_checked: boolean;
+  last_7_days: Array<{ date: string; label: string; checked: boolean; count: number; minutes: number }>;
 }
 
 export interface CloudSong {
@@ -573,6 +650,8 @@ export const api = {
         action: string;
         value?: number;
         delta?: number;
+        delta_sec?: number;
+        loop_mode?: "sequential" | "repeat_one" | "shuffle";
         minutes?: number;
         episodes?: number;
         album_id?: number;
@@ -681,11 +760,12 @@ export const api = {
     }),
 
   // Series -> Season -> Track 三级树 API
-  listSeries: (params?: { channel?: string; level_code?: string; q?: string }) => {
+  listSeries: (params?: { channel?: string; level_code?: string; q?: string; member_key?: string }) => {
     const qs = new URLSearchParams();
     if (params?.channel) qs.set("channel", params.channel);
     if (params?.level_code) qs.set("level_code", params.level_code);
     if (params?.q) qs.set("q", params.q);
+    if (params?.member_key) qs.set("member_key", params.member_key);
     return req<MediaSeries[]>(`/api/media/series?${qs.toString()}`);
   },
   createSeries: (payload: {
@@ -815,8 +895,9 @@ export const api = {
   controlRoomPlayback: (
     deviceId: string,
     payload: {
-      action: "pause" | "resume" | "stop" | "next" | "prev" | "jump" | "set_loop" | "set_sleep";
+      action: "pause" | "resume" | "stop" | "next" | "prev" | "jump" | "replay" | "seek_delta" | "set_loop" | "set_sleep";
       index?: number;
+      delta_sec?: number;
       loop_mode?: "sequential" | "repeat_one" | "shuffle";
       sleep_minutes?: number | null;
       sleep_episodes?: number | null;
@@ -833,11 +914,11 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ device_id: deviceId }),
     }),
-  saveProgress: (albumId: number, trackId: number, positionSec: number) =>
+  saveProgress: (albumId: number, trackId: number, positionSec: number, memberKey = "") =>
     req(`/api/media/albums/${albumId}/progress`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ track_id: trackId, position_sec: positionSec }),
+      body: JSON.stringify({ track_id: trackId, position_sec: positionSec, member_key: memberKey }),
     }),
   searchOnline: (q: string) => req<Array<{ title: string; duration_sec: number; uploader: string; url: string }>>(`/api/media/search-online?q=${encodeURIComponent(q)}`),
   getJobs: () => req<DownloadJob[]>("/api/media/jobs"),
@@ -972,6 +1053,83 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, rate, device_id: deviceId }),
     }),
+  getEnglishStats: (memberKey = "") => {
+    const qs = new URLSearchParams();
+    if (memberKey) qs.set("member_key", memberKey);
+    return req<EnglishCheckinStats>(`/api/english/stats?${qs.toString()}`);
+  },
+  recordEnglishCheckin: (payload: { track_id?: number | null; duration_min?: number; spoken_score?: number; note?: string; member_key?: string }) =>
+    req<EnglishCheckinStats>("/api/english/checkin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  evaluateEnglishSpeech: async (expectedText: string, blob: Blob, trackId?: number | null, memberKey = "") => {
+    const fd = new FormData();
+    fd.append("expected_text", expectedText);
+    if (trackId) fd.append("track_id", String(trackId));
+    if (memberKey) fd.append("member_key", memberKey);
+    fd.append("file", blob, "follow_read.webm");
+    return req<{ expected_text: string; recognized_text: string; stars: number; feedback: string }>(
+      "/api/english/evaluate-speech",
+      { method: "POST", body: fd }
+    );
+  },
+
+  // XiaoAi Cloud Bridge & MCP
+  getXiaoAiStatus: () => req<XiaoAiBridgeStatus>("/api/devices/xiaoai/status"),
+  discoverXiaoAiDevices: (payload: { mi_user?: string; mi_pass?: string; public_base_url?: string; save_credentials?: boolean }) =>
+    req<{ devices: XiaoAiDiscoveredDevice[]; count: number }>("/api/devices/xiaoai/discover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  bindXiaoAiDevice: (payload: { mi_device_id: string; miot_did?: string; name: string; hardware?: string; room: string; max_volume: number }) =>
+    req<DeviceInfo>("/api/devices/xiaoai/bind", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  toggleXiaoAiPolling: (payload: { enabled: boolean; poll_interval_sec?: number; trigger_keywords?: string }) =>
+    req<XiaoAiBridgeStatus>("/api/devices/xiaoai/poll-toggle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  listMcpTools: () =>
+    req<{ server: string; protocolVersion: string; tools: Array<{ name: string; description: string }> }>("/api/mcp/tools"),
+
+  // WebDAV & Storage Overview
+  listWebDavMounts: () => req<WebDavMount[]>("/api/media/webdav-mounts"),
+  previewWebDav: (payload: { base_url: string; remote_path?: string; username?: string; password?: string }) =>
+    req<{ entries: Array<{ name: string; is_dir: boolean; size: number; path: string }>; count: number }>("/api/media/webdav-mounts/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  createWebDavMount: (payload: {
+    name: string;
+    base_url: string;
+    username?: string;
+    password?: string;
+    remote_path?: string;
+    channel: "music" | "story" | "english" | "podcast";
+    level_code?: string;
+  }) =>
+    req<WebDavMount>("/api/media/webdav-mounts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  deleteWebDavMount: (id: number) => req(`/api/media/webdav-mounts/${id}`, { method: "DELETE" }),
+  syncWebDavMount: (id: number, maxFiles = 80) =>
+    req<{ mount_id: number; total_discovered: number; tracks_added: number; skipped: number; summary: string }>(
+      `/api/media/webdav-mounts/${id}/sync?max_files=${maxFiles}`,
+      { method: "POST" }
+    ),
+  getStorageOverview: () => req<StorageOverview>("/api/media/storage"),
+  cleanStorageCache: () =>
+    req<{ status: string; removed_files: number; freed_mb: number }>("/api/media/storage/clean-cache", { method: "POST" }),
   listEnglish: (stage?: string, q?: string) => {
     const qs = new URLSearchParams();
     if (stage) qs.set("stage", stage);
@@ -1136,8 +1294,12 @@ export const api = {
   },
   cloudMusicBatchDownload: (payload: {
     songs: CloudSong[];
+    series_id?: number | null;
     album_id?: number | null;
+    new_series_title?: string;
+    season_label?: string;
     new_album_title?: string;
+    auto_group_by_artist?: boolean;
     category?: "music" | "story" | "english" | "podcast";
     age_stage?: AgeStage;
   }) =>

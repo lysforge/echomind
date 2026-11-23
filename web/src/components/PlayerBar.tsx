@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { ListMusic, Pause, Play, Repeat, Shuffle, SkipBack, SkipForward, Speaker, Volume2 } from "lucide-react";
+import { ListMusic, Pause, Play, Repeat, RotateCcw, RotateCw, Shuffle, SkipBack, SkipForward, Speaker, Volume2 } from "lucide-react";
 import { api, DeviceInfo } from "../api";
 
 export interface QueueItem {
@@ -12,7 +12,9 @@ export interface QueueItem {
   durationSec: number;
   startPositionSec?: number;
   episodeNum?: number;
+  seasonNum?: number;
   seasonLabel?: string;
+  seriesId?: number;
   seriesTitle?: string;
 }
 
@@ -30,11 +32,14 @@ export function PlayerBar({
   progressSec,
   durationSec,
   loopMode,
+  playbackRate = 1,
   outputTarget,
   devices,
   onTogglePlay,
   onStep,
   onSeek,
+  onSeekDelta,
+  onCycleRate,
   onCycleLoop,
   onSelectOutput,
   onSelectIndex,
@@ -46,11 +51,14 @@ export function PlayerBar({
   progressSec: number;
   durationSec: number;
   loopMode: "sequential" | "repeat_one" | "shuffle";
+  playbackRate?: number;
   outputTarget: string; // "browser" or device_id
   devices: DeviceInfo[];
   onTogglePlay: () => void;
   onStep: (delta: number) => void;
   onSeek: (sec: number) => void;
+  onSeekDelta?: (deltaSec: number) => void;
+  onCycleRate?: () => void;
   onCycleLoop: () => void;
   onSelectOutput: (target: string) => void;
   onSelectIndex: (idx: number) => void;
@@ -113,6 +121,16 @@ export function PlayerBar({
             >
               {loopMode === "shuffle" ? <Shuffle className="h-3.5 w-3.5" /> : <Repeat className="h-3.5 w-3.5" />}
             </button>
+            {onSeekDelta && (
+              <button
+                onClick={() => onSeekDelta(-15)}
+                disabled={!current}
+                title="快退 15 秒"
+                className="hidden rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-100 disabled:opacity-40 sm:inline-flex"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+              </button>
+            )}
             <button
               onClick={() => onStep(-1)}
               disabled={!current}
@@ -134,6 +152,26 @@ export function PlayerBar({
             >
               <SkipForward className="h-4 w-4" />
             </button>
+            {onSeekDelta && (
+              <button
+                onClick={() => onSeekDelta(15)}
+                disabled={!current}
+                title="快进 15 秒"
+                className="hidden rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-100 disabled:opacity-40 sm:inline-flex"
+              >
+                <RotateCw className="h-3.5 w-3.5" />
+              </button>
+            )}
+            {onCycleRate && (
+              <button
+                onClick={onCycleRate}
+                disabled={!current || outputTarget !== "browser"}
+                title="切换播放倍速（磨耳朵支持 0.75x 慢速）"
+                className="rounded-lg border border-[var(--border-soft)] bg-white px-1.5 py-0.5 text-[10px] font-extrabold text-[var(--ink-secondary)] hover:border-[var(--brand-primary)] disabled:opacity-40"
+              >
+                {playbackRate}x
+              </button>
+            )}
           </div>
           <div className="hidden items-center gap-2 text-[11px] text-[var(--ink-muted)] sm:flex">
             <span>{fmtTime(progressSec)}</span>

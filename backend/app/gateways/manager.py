@@ -171,8 +171,19 @@ class DeviceConnectionManager:
 
         await self.broadcast_web({"type": "device_state", "device_id": device_id, **fields})
 
+    async def _get_xiaoai_mi_did(self, device_id: str) -> str | None:
+        from app.services.xiaoai_bridge import parse_xiaoai_capability
+
+        async with get_db() as conn:
+            cur = await conn.execute("SELECT capabilities_json FROM devices WHERE id = ?", (device_id,))
+            row = await cur.fetchone()
+            if not row:
+                return None
+            cap = parse_xiaoai_capability(dict(row))
+            return str(cap["mi_device_id"]) if cap else None
+
     async def set_device_volume(self, device_id: str, requested_volume: int) -> int:
-        """调节设备音量并强制受护耳上限 max_volume 保护。"""
+        """调节设备音量并强制受护耳上限 max_volume 保护（支持通用 WS 与真小爱音箱）。"""
         async with get_db() as conn:
             cur = await conn.execute("SELECT volume, max_volume FROM devices WHERE id = ?", (device_id,))
             row = await cur.fetchone()
@@ -187,6 +198,14 @@ class DeviceConnectionManager:
         if spk_ws:
             try:
                 await spk_ws.send_text(json.dumps({"type": "set_volume", "volume": clamped}))
+            except Exception:
+                pass
+        mi_did = await self._get_xiaoai_mi_did(device_id)
+        if mi_did:
+            try:
+                from app.services.xiaoai_bridge import xiaoai_bridge
+
+                await xiaoai_bridge.set_volume(mi_did, clamped)
             except Exception:
                 pass
         await self.broadcast_web({"type": "device_state", "device_id": device_id, "volume": clamped})
@@ -250,21 +269,55 @@ class DeviceConnectionManager:
             except Exception:
                 pass
 
-        xz_entry = self.xiaozhi_conns.get(device_id)
-        if xz_entry and track.get("file_path") and Path(track["file_path"]).exists():
-            ws: WebSocket = xz_entry["ws"]
-            session_id = xz_entry.get("session_id", "echomind-cast")
+        mi_did = await self._get_xiaoai_mi_did(device_id)
+        if mi_did and track_url:
             try:
-                frames = await encode_file_to_opus_frames(track["file_path"])
-                await ws.send_text(json.dumps({"type": "tts", "state": "start", "session_id": session_id}))
-                for pkt in frames:
-                    if xz_entry.get("abort"):
-                        break
-                    await ws.send_bytes(pkt)
-                    await asyncio.sleep(0.055)
-                await ws.send_text(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
+                from app.services.xiaoai_bridge import xiaoai_bridge
+
+                await xiaoai_bridge.play_url(mi_did, track_url)
             except Exception:
                 pass
+
+        xz_entry = self.xiaozhi_conns.get(device_id)
+        if xz_entry and track.get("file_path") and Path(track["file_path"]).exists():
+            # 取消上一条正在向小智推流的任务，异步后台推送 Opus 并在播完后自动连播下一集
+            prev_task = xz_entry.get("stream_task")
+            if prev_task and not prev_task.done():
+                xz_entry["abort"] = True
+                prev_task.cancel()
+            xz_entry["abort"] = False
+
+            async def _stream_opus_to_xiaozhi() -> None:
+                ws: WebSocket = xz_entry["ws"]
+                session_id = xz_entry.get("session_id", "echomind-cast")
+                sent_frames = 0
+                aborted = False
+                try:
+                    frames = await encode_file_to_opus_frames(track["file_path"])
+                    skip_frames = int(pos / 0.06) if pos > 1.0 else 0
+                    frames_to_send = frames[skip_frames:] if skip_frames < len(frames) else frames
+                    await ws.send_text(json.dumps({"type": "tts", "state": "start", "session_id": session_id}))
+                    for pkt in frames_to_send:
+                        if xz_entry.get("abort"):
+                            aborted = True
+                            break
+                        await ws.send_bytes(pkt)
+                        sent_frames += 1
+                        await asyncio.sleep(0.055)
+                    await ws.send_text(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
+                    if aborted:
+                        elapsed = pos + sent_frames * 0.06
+                        await self.report_hardware_progress(device_id, elapsed)
+                    elif self.playback_sessions.get(device_id, {}).get("status") == "playing":
+                        await self.advance_device_queue(device_id, delta=1, auto_triggered=True)
+                except asyncio.CancelledError:
+                    elapsed = pos + sent_frames * 0.06
+                    if elapsed > 1.0:
+                        await self.report_hardware_progress(device_id, elapsed)
+                except Exception:
+                    pass
+
+            xz_entry["stream_task"] = asyncio.create_task(_stream_opus_to_xiaozhi())
 
     async def send_speaker_control(self, device_id: str, command: str) -> None:
         if command in ("pause", "stop"):
@@ -275,9 +328,33 @@ class DeviceConnectionManager:
                 await spk_ws.send_text(json.dumps({"type": "control", "command": command}))
             except Exception:
                 pass
+        mi_did = await self._get_xiaoai_mi_did(device_id)
+        if mi_did:
+            try:
+                from app.services.xiaoai_bridge import xiaoai_bridge
+
+                await xiaoai_bridge.control(mi_did, command)
+            except Exception:
+                pass
         xz_entry = self.xiaozhi_conns.get(device_id)
         if xz_entry and command in ("pause", "stop"):
             xz_entry["abort"] = True
+
+    async def report_hardware_progress(self, device_id: str, position_sec: float) -> None:
+        """接收音箱客户端/小爱真机/ESP32 上报的精确播放秒数，并持久化写入三级断点表。"""
+        sess = self.playback_sessions.get(device_id)
+        if not sess or not sess.get("queue"):
+            return
+        idx = int(sess.get("current_index") or 0)
+        if not (0 <= idx < len(sess["queue"])):
+            return
+        pos = max(0.0, float(position_sec or 0.0))
+        sess["current_position_sec"] = pos
+        tr = sess["queue"][idx]
+        aid = sess.get("album_id") or tr.get("album_id")
+        tid = int(tr.get("id") or 0)
+        if aid and tid > 0:
+            await self._sync_series_album_progress(int(aid), tid, position_sec=pos, increment_play=False)
 
     def _cancel_session_watcher(self, device_id: str) -> None:
         sess = self.playback_sessions.get(device_id)
@@ -555,11 +632,12 @@ class DeviceConnectionManager:
         device_id: str,
         action: str,
         index: int | None = None,
+        delta_sec: float | None = None,
         loop_mode: str | None = None,
         sleep_minutes: int | None = None,
         sleep_episodes: int | None = None,
     ) -> dict[str, Any]:
-        """操控音箱房间播控队列（暂停/恢复/停止/上下集/跳集/循环/睡眠定时）。"""
+        """操控音箱房间播控队列（暂停/恢复/停止/上下集/跳集/重播/快进快退/循环/睡眠定时）。"""
         sess = self.playback_sessions.get(device_id)
 
         if action == "next":
@@ -569,10 +647,40 @@ class DeviceConnectionManager:
             res = await self.advance_device_queue(device_id, delta=-1, auto_triggered=False)
             return res or await self.get_room_playback_snapshot_by_id(device_id)
 
-        if action == "jump" and sess and index is not None and 0 <= index < len(sess["queue"]):
+        if action == "replay" and sess and sess.get("queue"):
+            self._cancel_session_watcher(device_id)
+            idx = int(sess.get("current_index") or 0)
+            sess["start_position_sec"] = 0.0
+            sess["current_position_sec"] = 0.0
+            sess["status"] = "playing"
+            sess["started_at"] = time.time()
+            tr = sess["queue"][idx]
+            if sess.get("album_id") and int(tr.get("id") or 0) > 0:
+                await self._sync_series_album_progress(int(sess["album_id"]), int(tr["id"]), position_sec=0.0, increment_play=True)
+            await self.cast_track_to_device(device_id, tr, start_position_sec=0.0)
+            sess["auto_task"] = asyncio.create_task(self._auto_advance_watcher(device_id))
+        elif action == "seek_delta" and sess and sess.get("queue"):
+            self._cancel_session_watcher(device_id)
+            idx = int(sess.get("current_index") or 0)
+            tr = sess["queue"][idx]
+            est_pos = float(sess.get("current_position_sec") or (float(sess.get("start_position_sec") or 0.0) + max(0.0, time.time() - float(sess.get("started_at") or time.time()))))
+            dur = float(tr.get("duration_sec") or 0.0)
+            new_pos = max(0.0, est_pos + float(delta_sec or 0.0))
+            if dur > 2.0:
+                new_pos = min(new_pos, dur - 1.0)
+            sess["start_position_sec"] = new_pos
+            sess["current_position_sec"] = new_pos
+            sess["status"] = "playing"
+            sess["started_at"] = time.time()
+            if sess.get("album_id") and int(tr.get("id") or 0) > 0:
+                await self._sync_series_album_progress(int(sess["album_id"]), int(tr["id"]), position_sec=new_pos, increment_play=False)
+            await self.cast_track_to_device(device_id, tr, start_position_sec=new_pos)
+            sess["auto_task"] = asyncio.create_task(self._auto_advance_watcher(device_id))
+        elif action == "jump" and sess and index is not None and 0 <= index < len(sess["queue"]):
             self._cancel_session_watcher(device_id)
             sess["current_index"] = index
             sess["start_position_sec"] = 0.0
+            sess["current_position_sec"] = 0.0
             sess["status"] = "playing"
             sess["started_at"] = time.time()
             tr = sess["queue"][index]
@@ -583,7 +691,11 @@ class DeviceConnectionManager:
         elif action == "pause":
             self._cancel_session_watcher(device_id)
             if sess:
+                est_pos = float(sess.get("current_position_sec") or (float(sess.get("start_position_sec") or 0.0) + max(0.0, time.time() - float(sess.get("started_at") or time.time()))))
+                sess["current_position_sec"] = est_pos
+                sess["start_position_sec"] = est_pos
                 sess["status"] = "paused"
+                await self.report_hardware_progress(device_id, est_pos)
             await self.send_speaker_control(device_id, "pause")
         elif action == "stop":
             self._cancel_session_watcher(device_id)
@@ -596,9 +708,10 @@ class DeviceConnectionManager:
             if sess and sess.get("queue"):
                 self._cancel_session_watcher(device_id)
                 idx = int(sess.get("current_index") or 0)
+                resume_pos = float(sess.get("current_position_sec") or sess.get("start_position_sec") or 0.0)
                 sess["status"] = "playing"
                 sess["started_at"] = time.time()
-                await self.cast_track_to_device(device_id, sess["queue"][idx])
+                await self.cast_track_to_device(device_id, sess["queue"][idx], start_position_sec=resume_pos)
                 sess["auto_task"] = asyncio.create_task(self._auto_advance_watcher(device_id))
         elif action == "set_loop" and sess and loop_mode in ("sequential", "repeat_one", "shuffle"):
             sess["loop_mode"] = loop_mode
@@ -680,7 +793,22 @@ class DeviceConnectionManager:
         motion: dict[str, Any] | None = None,
         tts_path: Path | None = None,
         track: dict[str, Any] | None = None,
+        restore_playback: bool = True,
     ) -> None:
+        # 若音箱正在放故事/音乐，记下当前状态以便语音播报完成后自动无缝续播
+        sess = self.playback_sessions.get(device_id)
+        was_playing = bool(restore_playback and track is None and sess and sess.get("status") == "playing" and sess.get("queue"))
+        resume_pos = 0.0
+        resume_track: dict[str, Any] | None = None
+        if was_playing and sess:
+            idx = int(sess.get("current_index") or 0)
+            if 0 <= idx < len(sess["queue"]):
+                resume_track = sess["queue"][idx]
+                resume_pos = float(
+                    sess.get("current_position_sec")
+                    or (float(sess.get("start_position_sec") or 0.0) + max(0.0, time.time() - float(sess.get("started_at") or time.time())))
+                )
+
         playing = f"正在播放：{track['title']}" if track else f"语音播报：{text[:18]}"
         locked = not bool((motion or {"allowed": True}).get("allowed", True))
         await self.update_device_state(device_id, playing_title=playing, motion_locked=locked)
@@ -697,6 +825,7 @@ class DeviceConnectionManager:
                 "tts_url": tts_url,
                 "track": track,
                 "track_url": track_url,
+                "restore_after": was_playing,
                 "timestamp": now_iso(),
             }
         )
@@ -706,10 +835,35 @@ class DeviceConnectionManager:
             try:
                 await spk_ws.send_text(
                     json.dumps(
-                        {"type": "play", "text": text, "tts_url": tts_url, "track_url": track_url},
+                        {
+                            "type": "play",
+                            "text": text,
+                            "tts_url": tts_url,
+                            "track_url": track_url,
+                            "restore_after": was_playing,
+                        },
                         ensure_ascii=False,
                     )
                 )
+            except Exception:
+                pass
+
+        mi_did = await self._get_xiaoai_mi_did(device_id)
+        if mi_did:
+            try:
+                from app.services.xiaoai_bridge import xiaoai_bridge
+
+                await xiaoai_bridge.speak(mi_did, text)
+                if was_playing and resume_track:
+                    est_tts_sec = max(3.0, min(14.0, len(text) / 4.2 + 1.5))
+
+                    async def _restore_xiaoai() -> None:
+                        await asyncio.sleep(est_tts_sec)
+                        cur_sess = self.playback_sessions.get(device_id)
+                        if cur_sess and cur_sess.get("status") == "playing":
+                            await self.cast_track_to_device(device_id, resume_track, start_position_sec=resume_pos)
+
+                    asyncio.create_task(_restore_xiaoai())
             except Exception:
                 pass
 
@@ -719,6 +873,10 @@ class DeviceConnectionManager:
             session_id = xz_entry.get("session_id", "echomind-push")
             try:
                 if tts_path and tts_path.exists():
+                    prev_task = xz_entry.get("stream_task")
+                    if prev_task and not prev_task.done():
+                        xz_entry["abort"] = True
+                        prev_task.cancel()
                     await ws.send_text(json.dumps({"type": "tts", "state": "start", "session_id": session_id}))
                     await ws.send_text(
                         json.dumps({"type": "tts", "state": "sentence_start", "text": text, "session_id": session_id}, ensure_ascii=False)
@@ -728,6 +886,8 @@ class DeviceConnectionManager:
                         await ws.send_bytes(pkt)
                         await asyncio.sleep(0.055)
                     await ws.send_text(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
+                    if was_playing and resume_track:
+                        await self.cast_track_to_device(device_id, resume_track, start_position_sec=resume_pos)
             except Exception:
                 pass
 

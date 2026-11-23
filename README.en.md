@@ -100,9 +100,12 @@ docker run -d --name echomind-music-dl -p 127.0.0.1:18080:8080 guohuiyuan/go-mus
 
 ## Smart Speaker & Hardware Integration
 
-- **Bridge Script (`clients/echomind_xiaoai_agent.py`)**: Download pre-filled bridge scripts after creating a speaker in **Hardware, Users & System** to receive full album queues and auto-advance via `track_ended`.
-- **6-Digit Pairing Discovery**: Unregistered speakers connecting to `/ws/speaker` enter a pending claim pool with a 6-digit pairing code.
-- **ESP32 Voice Hardware**: Full `/xiaozhi/ota/` and `/xiaozhi/v1/` Opus frame WebSocket support.
+- **Xiaomi XiaoAi Native Cloud Bridge (No Flashing Required)**: Built-in `miservice-fork` integration discovers and binds XiaoAi speakers directly under **Speakers & Settings → XiaoAi & Xiaozhi MCP**, supporting direct audio casting, cross-season auto-advance, TTS completion announcements with automatic playback restoration, hearing-protection volume clamping, and optional voice-command takeover.
+- **ESP32 Xiaozhi & Standard MCP Server**:
+  - Direct `/xiaozhi/ota/` + `/xiaozhi/v1/` Opus streaming with resume position memory and cross-season queue playback;
+  - Standard JSON-RPC 2.0 **MCP Server (`POST /api/mcp`)** exposing library search, series playback, AI background collection, and speaker casting tools for `xiaozhi-esp32-server` or any MCP client.
+- **Universal Bridge Agent (`clients/echomind_xiaoai_agent.py`)**: Connects to `/ws/speaker` with `start_position_sec` seek support, periodic 5-second `progress_report` syncing, and automatic playback restore after voice announcements.
+- **WebDAV / OpenList Sync, ID3 Auto-Grouping & Storage Ops**: Sync cloud drives (`Series/Season/Episode.mp3`), scan local directories with `mutagen` ID3 artist/album grouping, monitor disk capacity and clean caches, and control playback from mobile lock screens via PWA + MediaSession API.
 
 ---
 

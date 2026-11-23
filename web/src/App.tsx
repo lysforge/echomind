@@ -46,9 +46,10 @@ export default function App() {
 
   // 极简统一 5 导航（彻底取消前后台割裂切换）
   const [activeTab, setActiveTab] = useState<MainNavTab>("story");
-  const [hubSubTab, setHubSubTab] = useState<"rooms" | "family" | "tasks" | "system">("rooms");
+  const [hubSubTab, setHubSubTab] = useState<"rooms" | "hardware" | "family" | "tasks" | "system">("rooms");
   const [focusSeriesId, setFocusSeriesId] = useState<number | null>(null);
   const [refreshSignal, setRefreshSignal] = useState(0);
+  const [activeMemberKey, setActiveMemberKey] = useState<string>("");
 
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [voiceDrawerOpen, setVoiceDrawerOpen] = useState(false);
@@ -71,6 +72,7 @@ export default function App() {
   const [progressSec, setProgressSec] = useState(0);
   const [durationSec, setDurationSec] = useState(0);
   const [loopMode, setLoopMode] = useState<"sequential" | "repeat_one" | "shuffle">("sequential");
+  const [playbackRate, setPlaybackRate] = useState<number>(1);
   const [outputTarget, setOutputTarget] = useState<string>("browser");
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -249,12 +251,13 @@ export default function App() {
         pendingSeekRef.current = startPos;
         audioRef.current.src = item.streamUrl;
         audioRef.current.currentTime = startPos;
+        audioRef.current.playbackRate = playbackRate;
         audioRef.current
           .play()
           .then(() => {
             setIsPlaying(true);
             if (item.kind === "track" && item.id > 0 && item.parentId > 0) {
-              void api.saveProgress(item.parentId, item.id, startPos).catch(() => undefined);
+              void api.saveProgress(item.parentId, item.id, startPos, activeMemberKey).catch(() => undefined);
             }
           })
           .catch((e) => {
@@ -263,8 +266,47 @@ export default function App() {
           });
       }
     },
-    [outputTarget, loopMode, dashboard, showToast, fetchDashboard]
+    [outputTarget, loopMode, playbackRate, activeMemberKey, dashboard, showToast, fetchDashboard]
   );
+
+  // 浏览器端跨季无缝连播：播完当前季最后一集时自动切入同系列下一季第 1 集
+  const tryAdvanceNextSeasonInBrowser = useCallback(async (): Promise<boolean> => {
+    const cur = queue[currentIndex];
+    if (!cur || !cur.seriesId) return false;
+    try {
+      const all = await api.listSeries({ member_key: activeMemberKey || undefined });
+      const ser = all.find((s) => s.id === cur.seriesId);
+      if (!ser || !ser.seasons || ser.seasons.length <= 1) return false;
+      const curSeasonNum = cur.seasonNum || 1;
+      const nextSea = ser.seasons.find(
+        (sea) =>
+          (sea.tracks?.length || 0) > 0 &&
+          ((sea.season_num || 1) > curSeasonNum || ((sea.season_num || 1) === curSeasonNum && sea.id > cur.parentId))
+      );
+      if (!nextSea || !nextSea.tracks || nextSea.tracks.length === 0) return false;
+      const seaLbl = nextSea.season_label || `第${nextSea.season_num || 1}季`;
+      const nextItems: QueueItem[] = nextSea.tracks.map((t) => ({
+        id: t.id,
+        kind: "track",
+        title: t.title,
+        subtitle: `${ser.title} · ${seaLbl} · 第${t.episode_num}集`,
+        streamUrl: t.stream_url || `/api/media/tracks/${t.id}/stream`,
+        parentId: nextSea.id,
+        durationSec: t.duration_sec || 0,
+        startPositionSec: 0,
+        episodeNum: t.episode_num,
+        seasonNum: nextSea.season_num || 1,
+        seasonLabel: seaLbl,
+        seriesId: ser.id,
+        seriesTitle: ser.title,
+      }));
+      showToast(`本季播完，已自动跨季连播《${ser.title} · ${seaLbl}》`);
+      void activateItemAt(nextItems, 0, "browser");
+      return true;
+    } catch {
+      return false;
+    }
+  }, [queue, currentIndex, activeMemberKey, activateItemAt, showToast]);
 
   const handleStep = useCallback(
     (delta: number) => {
@@ -276,6 +318,15 @@ export default function App() {
         return;
       }
       if (queue.length === 0) return;
+      if (delta > 0 && loopMode === "sequential" && currentIndex + delta >= queue.length) {
+        void tryAdvanceNextSeasonInBrowser().then((switched) => {
+          if (!switched) {
+            const nextQueue = queue.map((q, i) => (i === 0 ? { ...q, startPositionSec: 0 } : q));
+            void activateItemAt(nextQueue, 0);
+          }
+        });
+        return;
+      }
       let nextIdx = currentIndex + delta;
       if (loopMode === "shuffle" && queue.length > 1) {
         do {
@@ -285,12 +336,51 @@ export default function App() {
         if (nextIdx >= queue.length) nextIdx = 0;
         if (nextIdx < 0) nextIdx = queue.length - 1;
       }
-      // 切到下一首时归零 startPositionSec，避免复用上一首的断点
       const nextQueue = queue.map((q, i) => (i === nextIdx ? { ...q, startPositionSec: 0 } : q));
       void activateItemAt(nextQueue, nextIdx);
     },
-    [outputTarget, queue, currentIndex, loopMode, activateItemAt, fetchDashboard, showToast]
+    [outputTarget, queue, currentIndex, loopMode, tryAdvanceNextSeasonInBrowser, activateItemAt, fetchDashboard, showToast]
   );
+
+  const handleSeek = useCallback(
+    (sec: number) => {
+      const clamped = Math.max(0, Math.min(durationSec > 0 ? durationSec : sec, sec));
+      setProgressSec(clamped);
+      if (audioRef.current && outputTarget === "browser") {
+        audioRef.current.currentTime = clamped;
+        const cur = queue[currentIndex];
+        if (cur && cur.kind === "track" && cur.id > 0 && cur.parentId > 0) {
+          void api.saveProgress(cur.parentId, cur.id, clamped, activeMemberKey).catch(() => undefined);
+        }
+      }
+    },
+    [durationSec, outputTarget, queue, currentIndex, activeMemberKey]
+  );
+
+  const handleSeekDelta = useCallback(
+    (deltaSec: number) => {
+      if (outputTarget !== "browser") {
+        void api
+          .controlRoomPlayback(outputTarget, { action: "seek_delta", delta_sec: deltaSec })
+          .then(() => showToast(deltaSec > 0 ? `音箱快进 ${deltaSec} 秒` : `音箱倒退 ${Math.abs(deltaSec)} 秒`))
+          .catch((e) => showToast((e as Error).message));
+        return;
+      }
+      const curTime = audioRef.current?.currentTime ?? progressSec;
+      handleSeek(curTime + deltaSec);
+    },
+    [outputTarget, progressSec, handleSeek, showToast]
+  );
+
+  const handleCycleRate = useCallback(() => {
+    const rates = [0.75, 1, 1.25, 1.5];
+    const next = rates[(rates.indexOf(playbackRate) + 1) % rates.length];
+    setPlaybackRate(next);
+    if (audioRef.current) {
+      audioRef.current.playbackRate = next;
+    }
+    showToast(`播放速度已切换为 ${next}x`);
+  }, [playbackRate, showToast]);
 
   const handleTogglePlay = () => {
     const cur = queue[currentIndex];
@@ -345,6 +435,15 @@ export default function App() {
         if (idx >= 0) void activateItemAt(queue, idx);
         else if (ctrl.episode_num >= 1 && ctrl.episode_num <= queue.length) void activateItemAt(queue, ctrl.episode_num - 1);
       }
+    } else if (act === "replay") {
+      handleSeek(0);
+      if (audioRef.current && audioRef.current.src) {
+        void audioRef.current.play().then(() => setIsPlaying(true));
+      }
+    } else if (act === "seek_delta" && typeof ctrl.delta_sec === "number") {
+      handleSeekDelta(ctrl.delta_sec);
+    } else if (act === "set_loop" && ctrl.loop_mode) {
+      setLoopMode(ctrl.loop_mode);
     } else if (act === "volume_set" && typeof ctrl.value === "number") {
       if (audioRef.current) audioRef.current.volume = Math.max(0, Math.min(1, ctrl.value / 100));
     } else if (act === "volume_delta" && typeof ctrl.delta === "number") {
@@ -361,16 +460,32 @@ export default function App() {
     }
   };
 
-  const handleSeek = (sec: number) => {
-    setProgressSec(sec);
-    if (audioRef.current && outputTarget === "browser") {
-      audioRef.current.currentTime = sec;
-      const cur = queue[currentIndex];
-      if (cur && cur.kind === "track" && cur.id > 0 && cur.parentId > 0) {
-        void api.saveProgress(cur.parentId, cur.id, sec).catch(() => undefined);
-      }
+  // 手机锁屏 / 耳机线控 MediaSession 集成
+  useEffect(() => {
+    if (typeof navigator === "undefined" || !("mediaSession" in navigator)) return;
+    const cur = queue[currentIndex];
+    if (!cur) return;
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: cur.title,
+        artist: cur.subtitle || "EchoMind 声忆",
+        album: cur.seriesTitle || "家庭声音中枢",
+      });
+      navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
+      navigator.mediaSession.setActionHandler("play", () => {
+        if (audioRef.current && audioRef.current.paused) void audioRef.current.play();
+      });
+      navigator.mediaSession.setActionHandler("pause", () => {
+        audioRef.current?.pause();
+      });
+      navigator.mediaSession.setActionHandler("previoustrack", () => handleStep(-1));
+      navigator.mediaSession.setActionHandler("nexttrack", () => handleStep(1));
+      navigator.mediaSession.setActionHandler("seekbackward", () => handleSeekDelta(-15));
+      navigator.mediaSession.setActionHandler("seekforward", () => handleSeekDelta(15));
+    } catch {
+      // 部分旧浏览器不支持全部 MediaSession Handler
     }
-  };
+  }, [queue, currentIndex, isPlaying, handleStep, handleSeekDelta]);
 
   const handleCycleLoop = () => {
     const next = loopMode === "sequential" ? "repeat_one" : loopMode === "repeat_one" ? "shuffle" : "sequential";
@@ -557,12 +672,13 @@ export default function App() {
           const now = Date.now();
           if (cur && cur.kind === "track" && cur.id > 0 && cur.parentId > 0 && now - lastProgressSyncRef.current > 5000) {
             lastProgressSyncRef.current = now;
-            void api.saveProgress(cur.parentId, cur.id, t).catch(() => undefined);
+            void api.saveProgress(cur.parentId, cur.id, t, activeMemberKey).catch(() => undefined);
           }
         }}
         onLoadedMetadata={(e) => {
           const d = e.currentTarget.duration;
           if (Number.isFinite(d) && d > 0) setDurationSec(d);
+          e.currentTarget.playbackRate = playbackRate;
           if (pendingSeekRef.current > 1 && (!Number.isFinite(d) || pendingSeekRef.current < d - 1)) {
             e.currentTarget.currentTime = pendingSeekRef.current;
           }
@@ -583,7 +699,7 @@ export default function App() {
           const cur = queue[currentIndex];
           const t = audioRef.current?.currentTime || 0;
           if (cur && cur.kind === "track" && cur.id > 0 && cur.parentId > 0 && t > 1) {
-            void api.saveProgress(cur.parentId, cur.id, t).catch(() => undefined);
+            void api.saveProgress(cur.parentId, cur.id, t, activeMemberKey).catch(() => undefined);
           }
         }}
       />
@@ -636,6 +752,21 @@ export default function App() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {dashboard && dashboard.members.length > 0 && (
+              <select
+                value={activeMemberKey}
+                onChange={(e) => setActiveMemberKey(e.target.value)}
+                title="切换听音成员（各自独立记住播放位置与英语打卡）"
+                className="rounded-xl border border-[var(--border-soft)] bg-[var(--bg-card)] px-2.5 py-1.5 text-xs font-semibold text-[var(--ink-primary)]"
+              >
+                <option value="">全家共享进度</option>
+                {dashboard.members.map((m) => (
+                  <option key={m.id} value={`member:${m.id}`}>
+                    👤 {m.nickname} 的独立进度
+                  </option>
+                ))}
+              </select>
+            )}
             <ThemeSwitcher />
             {dashboard && (
               <button
@@ -743,6 +874,7 @@ export default function App() {
                 <ChannelWorkspacePage
                   channel={activeTab}
                   dashboard={dashboard}
+                  memberKey={activeMemberKey}
                   refreshSignal={refreshSignal}
                   focusSeriesId={focusSeriesId}
                   onClearFocusSeries={() => setFocusSeriesId(null)}
@@ -757,6 +889,7 @@ export default function App() {
               {activeTab === "english" && (
                 <EnglishEnlightenmentPage
                   dashboard={dashboard}
+                  memberKey={activeMemberKey}
                   refreshSignal={refreshSignal}
                   onPlayQueue={(items, idx) => void activateItemAt(items, idx)}
                   onPlayUrl={playSingleUrl}
@@ -794,11 +927,14 @@ export default function App() {
         progressSec={progressSec}
         durationSec={durationSec}
         loopMode={loopMode}
+        playbackRate={playbackRate}
         outputTarget={outputTarget}
         devices={dashboard?.devices || []}
         onTogglePlay={handleTogglePlay}
         onStep={handleStep}
         onSeek={handleSeek}
+        onSeekDelta={handleSeekDelta}
+        onCycleRate={handleCycleRate}
         onCycleLoop={handleCycleLoop}
         onSelectOutput={(nextTarget) => {
           setOutputTarget(nextTarget);
