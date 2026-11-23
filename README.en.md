@@ -23,23 +23,20 @@ EchoMind starts with **zero fabricated data** — empty devices, members, and me
 
 ## Key Features
 
-EchoMind keeps daily listening distraction-free by separating the **Family Listening Console** from the admin-only **Content Studio**.
+EchoMind features an **ultra-clean, unified 5-tab workspace** — no confusing front/back console switching. Browse, collect/upload directly inside any folder, resume from your exact second, and cast to any room speaker in seconds.
 
-### 1. Family Listening Console
-
-| Space | Capabilities |
+| Workspace | Capabilities |
 | --- | --- |
-| **Cloud Music & Batch Download** | Powered by a companion `go-music-dl` engine via Docker Compose: aggregate search across NetEase, QQ Music, Kugou, Kuwo, Migu, Bilibili, and more; browse live toplists; resolve full playlists/albums; stream with automatic fallback source switching; and batch-download tracks directly into persistent server albums with LRC lyrics. |
-| **Private Library & Podcasts** | Unified **Album → Track** organization across music playlists, RSS podcasts, picture books, and graded English courses, featuring custom sub-tags, age-aware member sorting, progress resume, and one-click speaker casting. |
-| **Multi-Room Speakers & Timers** | Sonos/Connect-style server-managed queues pushing entire albums to multiple rooms simultaneously, loop modes, sleep timers (by minutes or episode count), and daily cron schedules. |
-| **Family & Voiceprints** | Dynamic age-stage & English-stage tracking, in-browser voiceprint enrollment, and three-tier memory isolation (`family`, `personal`, `growth`) with fail-safe fallback to `child_safe` mode. |
-| **Voice Control Drawer** | Natural-language playback commands (play tracks/episodes, next/previous, adjust volume clamped to `max_volume`, pause/resume, sleep timers) via voice or text. |
+| **📖 Story Library** | **3-level tree (`Series → Season → Episode`)** with exact playback position memory (`Season · Episode · mm:ss`), one-click resume, **automatic cross-season playback** when a season ends, plus in-place online search/fetch, URL import, batch audio upload, and text-to-speech synthesis. |
+| **🎵 Music Library** | Clean `Artist / Playlist → Album → Track` catalog combined directly with multi-source search, live charts, playlist resolution, automatic fallback source switching, and batch server downloads (with LRC lyrics and `-16 LUFS` normalization via companion `go-music-dl`). |
+| **🔤 English Enlightenment** | Graded **L1–L5 learning ladder** (`L1 Nursery Songs` → `L2 Phonics & Daily` → `L3 Graded Readers` → `L4 Chapter Stories` → `L5 Native Fluency`), persistent resume banner, tap-to-pronounce vocabulary cards, completion tracking, AI unit generator, custom audio import, and speaker casting. |
+| **🎙️ Podcasts** | Channel → Season → Episode podcast library with built-in RSS subscriptions, preset directories, auto-sync, and exact progress resume. |
+| **🔊 Speakers & Settings** | Multi-room Sonos/Connect-style playback queues, hearing-protection max volume, minute/episode sleep timers, daily cron schedules, family voiceprint memory isolation, background collection task monitor, local folder scanner, and LLM/account settings. |
 
-### 2. Admin Content Studio & System Settings
+### Voice-Driven Collection, AI Auto-Classification & Speaker Announcements
 
-- **Catalog & Sub-Tag Management**: Customize channel sub-tags and track/lyric metadata.
-- **Five Content Ingest Pipelines**: Voice Cache Inbox (promote auto-cached online plays into curated albums), Local Folder Scanner, Upload & URL Fetch (`yt-dlp`), Podcast RSS Subscriptions, and Text-to-Audio / AI English Course Builder.
-- **Hardware, Users & Settings**: Configure companion `go-music-dl` URL & sources, LLM providers (DeepSeek / OpenAI-compatible / Ollama), TTS voices, hearing-protection max volume, quiet hours, 6-digit speaker pairing codes, and multi-user RBAC.
+- **Voice Collect & Auto-Classify**: Ask your speaker to collect stories, songs, or English lessons → EchoMind fetches audio in the background, uses LLM/rules to classify it automatically into the right **Channel → Series → Season → Episode**, and **announces completion directly on the speaker** (with real-time web notifications).
+- **Precision Voice Navigation**: Resume any series from its remembered season/episode/second, jump directly to a specific season and episode (supporting both Arabic and Chinese numerals), jump within the active speaker queue, adjust volume safely, or set sleep timers.
 
 ---
 

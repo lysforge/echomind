@@ -166,6 +166,8 @@ async def interact_http(
             album_id=brain_resp.play_track.get("album_id"),
             album_title=str(brain_resp.play_track.get("album_title") or ""),
             start_index=idx,
+            series_id=brain_resp.play_track.get("series_id"),
+            start_position_sec=float(brain_resp.play_track.get("start_position_sec") or 0.0),
         )
     track_url = None
     if brain_resp.play_track:
@@ -181,6 +183,7 @@ async def interact_http(
         "play_track": brain_resp.play_track,
         "queue_tracks": brain_resp.queue_tracks,
         "control_action": brain_resp.control_action,
+        "background_job": brain_resp.background_job,
         "track_url": track_url,
         "learned_item": brain_resp.learned_item,
     }

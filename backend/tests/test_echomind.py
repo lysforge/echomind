@@ -724,3 +724,191 @@ def test_cloud_music_multi_source_search_toplists_and_batch_download():
         httpd.server_close()
 
 
+def test_series_three_level_resume_cross_season_voice_collect_and_english_ladder(monkeypatch):
+    """验证三级分类(系列→季→集)、断点续播、语音跳季跳集、跨季自动连播、音箱语音采集+AI自动分类+播报通知与英语L1-L5启蒙。"""
+    import time
+    from pathlib import Path
+    from app.services import ai_curator
+    from app.services.collector import insert_normalized_track
+
+    with TestClient(app) as client:
+        hdr = {"Authorization": f"Bearer {client.post('/api/auth/login', json={'username': 'boss', 'password': 'pass1234'}).json()['token']}"}
+        # 确保夜间免打扰关闭，不受 UTC 时间影响
+        assert client.put("/api/settings", headers=hdr, json={"quiet_hours_enabled": False}).status_code == 200
+
+        # 1. 创建一级系列《汪汪队》（自动建第1季）+ 新增第2季 + 每季导入 2 集真实音频
+        s_resp = client.post(
+            "/api/media/series",
+            headers=hdr,
+            json={
+                "title": "汪汪队",
+                "channel": "story",
+                "cover_emoji": "🐶",
+                "auto_create_first_season": True,
+                "first_season_label": "第1季",
+            },
+        )
+        assert s_resp.status_code == 200
+        series_id = s_resp.json()["id"]
+        s1_album_id = s_resp.json()["seasons"][0]["id"]
+
+        s2_resp = client.post(
+            f"/api/media/series/{series_id}/seasons",
+            headers=hdr,
+            json={"season_num": 2, "season_label": "第2季"},
+        )
+        assert s2_resp.status_code == 200
+        s2_album_id = s2_resp.json()["id"]
+
+        wav_bytes = _make_synthetic_voice_wav(f0_hz=420.0, duration_sec=0.6)
+        s1_t1 = client.post("/api/media/collect/upload", headers=hdr, data={"album_id": str(s1_album_id)}, files={"file": ("第1集_救援出发.wav", wav_bytes, "audio/wav")}).json()
+        s1_t2 = client.post("/api/media/collect/upload", headers=hdr, data={"album_id": str(s1_album_id)}, files={"file": ("第2集_阿奇立功.wav", wav_bytes, "audio/wav")}).json()
+        s2_t1 = client.post("/api/media/collect/upload", headers=hdr, data={"album_id": str(s2_album_id)}, files={"file": ("第1集_海上巡逻.wav", wav_bytes, "audio/wav")}).json()
+        s2_t2 = client.post("/api/media/collect/upload", headers=hdr, data={"album_id": str(s2_album_id)}, files={"file": ("第2集_冰雪大救援.wav", wav_bytes, "audio/wav")}).json()
+
+        # 2. 保存第2季第1集 42.5 秒的播放位置，验证三级树 resume_info 精准记忆
+        pr = client.post(
+            f"/api/media/albums/{s2_album_id}/progress",
+            headers=hdr,
+            json={"track_id": s2_t1["track_id"], "position_sec": 42.5},
+        )
+        assert pr.status_code == 200
+
+        tree = client.get("/api/media/series?channel=story", headers=hdr).json()
+        paw = next((x for x in tree if x["id"] == series_id), None)
+        assert paw is not None
+        assert paw["season_count"] == 2
+        assert paw["total_tracks"] == 4
+        assert paw["resume_info"] is not None
+        assert paw["resume_info"]["season_num"] == 2
+        assert paw["resume_info"]["episode_num"] == 1
+        assert abs(paw["resume_info"]["position_sec"] - 42.5) < 0.1
+
+        # 3. 语音喊「播放汪汪队」-> 自动从记忆的 第2季第1集 42.5 秒续播
+        v_resume = client.post("/api/interact", headers=hdr, json={"text": "播放汪汪队"}).json()
+        assert v_resume["play_track"] is not None
+        assert v_resume["play_track"]["id"] == s2_t1["track_id"]
+        assert abs(v_resume["play_track"]["start_position_sec"] - 42.5) < 0.1
+        assert "第2季" in v_resume["reply_text"]
+
+        # 4. 语音喊「播放汪汪队第一季第二集」-> 中文数字跳季跳集精准命中第1季第2集
+        v_jump_season = client.post("/api/interact", headers=hdr, json={"text": "播放汪汪队第一季第二集"}).json()
+        assert v_jump_season["play_track"] is not None
+        assert v_jump_season["play_track"]["id"] == s1_t2["track_id"]
+        assert v_jump_season["play_track"]["season_num"] == 1
+        assert v_jump_season["play_track"]["episode_num"] == 2
+
+        # 5. 绑定模拟音箱并通过 WebSocket 验证：会话内「跳到第1集」+ 播完第1季最后一集自动跨季连播第2季第1集
+        dev = client.post(
+            "/api/devices",
+            headers=hdr,
+            json={"name": "儿童房测试音箱", "device_type": "speaker_xiaoai", "room": "儿童房", "max_volume": 75, "wake_word": "你好小音"},
+        ).json()
+        dev_id = dev["id"]
+        dev_token = dev["auth_token"]
+
+        # 准备受控的模拟在线搜索与下载器，确保音箱语音采集全链路 100% 确定性（不依赖外网）
+        async def _fake_search(q: str, limit: int = 5):
+            return [
+                {"title": "小猪佩奇 第1集 泥坑历险", "duration_sec": 60.0, "uploader": "test", "url": "https://mock.local/peppa/1"},
+                {"title": "小猪佩奇 第2集 恐龙玩具", "duration_sec": 65.0, "uploader": "test", "url": "https://mock.local/peppa/2"},
+            ][:limit]
+
+        async def _fake_download(url: str, album_id: int, title_hint: str = ""):
+            tmp = Path("/tmp") / f"test_peppa_{int(time.time() * 100000)}.wav"
+            tmp.write_bytes(wav_bytes)
+            try:
+                ep = ai_curator.extract_episode_number_from_title(title_hint)
+                return await insert_normalized_track(album_id=album_id, title=title_hint, raw_file=tmp, source_url=url, episode_num=ep)
+            finally:
+                tmp.unlink(missing_ok=True)
+
+        monkeypatch.delenv("ECHOMIND_DISABLE_ONLINE_SEARCH", raising=False)
+        monkeypatch.setattr(ai_curator, "search_online_audio", _fake_search)
+        monkeypatch.setattr(ai_curator, "_download_ytdlp_single_item", _fake_download)
+
+        with client.websocket_connect(f"/ws/speaker?device_id={dev_id}&token={dev_token}") as ws:
+            # 推第1季第2集（本季最后一集）到音箱
+            push_r = client.post(
+                "/api/playback/push",
+                headers=hdr,
+                json={"device_ids": [dev_id], "album_id": s1_album_id, "start_index": 1, "resume": False},
+            )
+            assert push_r.status_code == 200
+            m1 = ws.receive_json()
+            assert m1["type"] == "play_url"
+            assert "阿奇立功" in m1["title"]
+
+            # 音箱语音说「跳到第1集」-> 当前队列内精准跳到第1集
+            ws.send_json({"type": "chat", "text": "跳到第1集"})
+            got_jump_play = False
+            got_jump_reply = False
+            for _ in range(4):
+                pkt = ws.receive_json()
+                if pkt["type"] == "play_url" and "救援出发" in pkt["title"]:
+                    got_jump_play = True
+                if pkt["type"] == "reply" and "第 1 集" in pkt["reply_text"]:
+                    got_jump_reply = True
+                if got_jump_play and got_jump_reply:
+                    break
+            assert got_jump_play and got_jump_reply
+
+            # 切到第1季第2集（本季末尾）后上报 track_ended -> 自动跨季连播第2季第1集！
+            assert client.post(f"/api/playback/rooms/{dev_id}/control", headers=hdr, json={"action": "jump", "index": 1}).status_code == 200
+            _ = ws.receive_json()
+            ws.send_json({"type": "track_ended"})
+            m_cross = ws.receive_json()
+            assert m_cross["type"] == "play_url"
+            assert "海上巡逻" in m_cross["title"]
+
+            rooms = client.get("/api/playback/rooms", headers=hdr).json()
+            cur_room = next((r for r in rooms if r["id"] == dev_id), None)
+            assert cur_room is not None and cur_room["session"]["season_num"] == 2
+            assert cur_room["session"]["album_id"] == s2_album_id
+
+            # 6. 音箱语音采集：「帮我采集小猪佩奇第二季的故事」-> 立即回复确认 -> AI自动分类入库 -> 音箱收到播报通知！
+            ws.send_json({"type": "chat", "text": "帮我采集小猪佩奇第二季的故事"})
+            ack_pkt = ws.receive_json()
+            assert ack_pkt["type"] == "reply"
+            assert ack_pkt["background_job"] is not None
+            assert "采集" in ack_pkt["reply_text"]
+
+            # 等待后台任务完成并收到音箱主动播报消息 type=="play"
+            announce_pkt = None
+            for _ in range(15):
+                pkt = ws.receive_json()
+                if pkt.get("type") == "play" and "小猪佩奇" in pkt.get("text", ""):
+                    announce_pkt = pkt
+                    break
+            assert announce_pkt is not None
+            assert announce_pkt.get("tts_url", "").startswith("/api/tts-cache/")
+            assert "第2季" in announce_pkt["text"]
+            assert "2 集" in announce_pkt["text"]
+
+        # 验证小猪佩奇已被 AI 自动分类到「故事书架 → 小猪佩奇 → 第2季」并有序入库 2 集
+        story_tree = client.get("/api/media/series?channel=story", headers=hdr).json()
+        peppa = next((x for x in story_tree if x["title"] == "小猪佩奇"), None)
+        assert peppa is not None
+        assert len(peppa["seasons"]) == 1
+        assert peppa["seasons"][0]["season_num"] == 2
+        assert peppa["seasons"][0]["season_label"] == "第2季"
+        assert len(peppa["seasons"][0]["tracks"]) == 2
+        assert peppa["seasons"][0]["tracks"][0]["episode_num"] == 1
+        assert peppa["seasons"][0]["tracks"][1]["episode_num"] == 2
+
+        # 7. 英语启蒙 L1~L5 分级树、打卡进度与词卡点读验证
+        seed_en = client.post("/api/english/courses/seed-builtin", headers=hdr)
+        assert seed_en.status_code == 200
+        l1_list = client.get("/api/media/series?channel=english&level_code=L1", headers=hdr).json()
+        assert len(l1_list) >= 1
+        first_l1_track = l1_list[0]["seasons"][0]["tracks"][0]
+        assert client.patch(f"/api/media/tracks/{first_l1_track['id']}", headers=hdr, json={"completed": True}).status_code == 200
+        l1_after = client.get("/api/media/series?channel=english&level_code=L1", headers=hdr).json()
+        assert l1_after[0]["completed_tracks"] >= 1
+
+        pron = client.post("/api/english/pronounce", headers=hdr, json={"text": "Good morning!"})
+        assert pron.status_code == 200
+        assert pron.json()["tts_url"].startswith("/api/tts-cache/")
+
+
+

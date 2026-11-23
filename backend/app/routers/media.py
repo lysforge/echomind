@@ -15,8 +15,13 @@ from pydantic import BaseModel
 
 from app.auth import get_current_user, require_admin
 from app.config import load_settings
-from app.db import get_db, now_iso
+from app.db import ENGLISH_LEVEL_TO_STAGE, ENGLISH_STAGE_TO_LEVEL, _default_channel_emoji, _default_season_label, get_db, now_iso
 from app.gateways.manager import device_manager
+from app.services.ai_curator import (
+    enqueue_ai_collect,
+    ensure_series_and_season,
+    update_playback_progress,
+)
 from app.services.collector import (
     LIVE_STREAM_SESSIONS,
     _looks_like_direct_audio_url,
@@ -40,9 +45,50 @@ class CategoryTagCreate(BaseModel):
     sort_order: int = 10
 
 
+class SeriesCreate(BaseModel):
+    title: str
+    channel: Literal["music", "story", "english", "podcast"] = "story"
+    level_code: str = ""
+    cover_emoji: str = ""
+    author: str = ""
+    description: str = ""
+    auto_create_first_season: bool = True
+    first_season_label: str = ""
+
+
+class SeriesPatch(BaseModel):
+    title: str | None = None
+    channel: Literal["music", "story", "english", "podcast"] | None = None
+    level_code: str | None = None
+    cover_emoji: str | None = None
+    author: str | None = None
+    description: str | None = None
+
+
+class SeasonCreate(BaseModel):
+    season_num: int | None = None
+    season_label: str = ""
+    title: str = ""
+    description: str = ""
+    play_mode: Literal["sequential", "shuffle"] = "sequential"
+
+
+class AiCollectRequest(BaseModel):
+    query: str
+    channel_hint: Literal["music", "story", "english", "podcast"] | None = None
+    series_id: int | None = None
+    album_id: int | None = None
+    max_items: int = 5
+    device_id: str = ""
+    notify_speaker: bool = True
+
+
 class AlbumCreate(BaseModel):
     title: str
     category: Literal["music", "story", "english", "podcast"] = "music"
+    series_id: int | None = None
+    season_num: int = 1
+    season_label: str = ""
     sub_tag: str = ""
     age_stage: Literal["S1_0_3", "S2_3_6", "S3_6_9", "S4_9_12", "S5_12_18", "S6_ALL"] = "S6_ALL"
     english_level: Literal["Pre_A1", "A1", "A2", "B1", "B2_PLUS", "adult"] = "Pre_A1"
@@ -57,6 +103,9 @@ class AlbumCreate(BaseModel):
 class AlbumPatch(BaseModel):
     title: str | None = None
     category: Literal["music", "story", "english", "podcast"] | None = None
+    series_id: int | None = None
+    season_num: int | None = None
+    season_label: str | None = None
     sub_tag: str | None = None
     age_stage: Literal["S1_0_3", "S2_3_6", "S3_6_9", "S4_9_12", "S5_12_18", "S6_ALL"] | None = None
     english_level: Literal["Pre_A1", "A1", "A2", "B1", "B2_PLUS", "adult"] | None = None
@@ -192,6 +241,316 @@ async def delete_tag(
     return {"status": "deleted"}
 
 
+# -------------------- 一级系列 → 二级季/专辑 → 三级单集 树形 CRUD --------------------
+
+
+@router.get("/series")
+async def list_series_tree(
+    channel: str | None = Query(default=None),
+    level_code: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """返回清晰的三级树：一级系列合集 → 二级季/专辑/单元列表 → 三级单集列表及精确断点续播摘要。"""
+    async with get_db() as conn:
+        # 兜底确保所有非收件箱专辑都挂在 series 下
+        cur_orphan = await conn.execute("SELECT id FROM media_albums WHERE series_id IS NULL AND is_inbox = 0 LIMIT 1")
+        if await cur_orphan.fetchone():
+            from app.db import _backfill_series_for_orphan_albums
+
+            await _backfill_series_for_orphan_albums(conn)
+            await conn.commit()
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if channel and channel != "all":
+            clauses.append("channel = ?")
+            params.append(channel)
+        if level_code and level_code != "all":
+            clauses.append("level_code = ?")
+            params.append(level_code)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cur_s = await conn.execute(
+            f"SELECT * FROM media_series {where_sql} ORDER BY COALESCE(last_played_at, '') DESC, id DESC",
+            params,
+        )
+        series_list = [dict(r) for r in await cur_s.fetchall()]
+
+        cur_a = await conn.execute(
+            "SELECT * FROM media_albums WHERE is_inbox = 0 ORDER BY season_num ASC, id ASC"
+        )
+        albums_raw = [dict(r) for r in await cur_a.fetchall()]
+
+        cur_t = await conn.execute(
+            "SELECT * FROM media_tracks ORDER BY album_id ASC, episode_num ASC, id ASC"
+        )
+        tracks_raw = [dict(r) for r in await cur_t.fetchall()]
+
+    tracks_by_album: dict[int, list[dict[str, Any]]] = {}
+    tracks_by_id: dict[int, dict[str, Any]] = {}
+    for t in tracks_raw:
+        try:
+            t["vocab"] = json.loads(t.get("vocab_json") or "[]")
+        except Exception:
+            t["vocab"] = []
+        t["stream_url"] = f"/api/media/tracks/{t['id']}/stream"
+        tracks_by_album.setdefault(int(t["album_id"]), []).append(t)
+        tracks_by_id[int(t["id"])] = t
+
+    albums_by_series: dict[int, list[dict[str, Any]]] = {}
+    albums_by_id: dict[int, dict[str, Any]] = {}
+    for a in albums_raw:
+        a["tracks"] = tracks_by_album.get(int(a["id"]), [])
+        a["track_count"] = len(a["tracks"])
+        a["season_label"] = (a.get("season_label") or "").strip() or _default_season_label(a["category"], int(a.get("season_num") or 1))
+        if a.get("series_id"):
+            albums_by_series.setdefault(int(a["series_id"]), []).append(a)
+        albums_by_id[int(a["id"])] = a
+
+    kw = (q or "").strip().lower()
+    out: list[dict[str, Any]] = []
+    for s in series_list:
+        sid = int(s["id"])
+        seasons = albums_by_series.get(sid, [])
+        all_tracks = [t for sea in seasons for t in sea.get("tracks", [])]
+        if kw:
+            hit_s = kw in s["title"].lower() or kw in (s.get("author") or "").lower() or kw in (s.get("level_code") or "").lower()
+            hit_sea = any(kw in sea["title"].lower() or kw in sea["season_label"].lower() for sea in seasons)
+            hit_tr = any(kw in t["title"].lower() for t in all_tracks)
+            if not (hit_s or hit_sea or hit_tr):
+                continue
+
+        # 精确构造断点续播信息
+        resume_info: dict[str, Any] | None = None
+        last_tid = s.get("last_track_id")
+        last_aid = s.get("last_album_id")
+        if last_tid and int(last_tid) in tracks_by_id:
+            tr = tracks_by_id[int(last_tid)]
+            alb = albums_by_id.get(int(tr["album_id"])) or (albums_by_id.get(int(last_aid)) if last_aid else None)
+            if alb:
+                resume_info = {
+                    "album_id": alb["id"],
+                    "season_num": int(alb.get("season_num") or 1),
+                    "season_label": alb["season_label"],
+                    "track_id": tr["id"],
+                    "track_title": tr["title"],
+                    "episode_num": int(tr.get("episode_num") or 1),
+                    "position_sec": float(s.get("last_position_sec") or tr.get("last_position_sec") or 0.0),
+                    "last_played_at": s.get("last_played_at") or tr.get("last_played_at"),
+                }
+        elif seasons:
+            # 兜底看季里的播放记录
+            for sea in seasons:
+                if sea.get("last_track_id") and int(sea["last_track_id"]) in tracks_by_id:
+                    tr = tracks_by_id[int(sea["last_track_id"])]
+                    resume_info = {
+                        "album_id": sea["id"],
+                        "season_num": int(sea.get("season_num") or 1),
+                        "season_label": sea["season_label"],
+                        "track_id": tr["id"],
+                        "track_title": tr["title"],
+                        "episode_num": int(tr.get("episode_num") or 1),
+                        "position_sec": float(sea.get("last_position_sec") or 0.0),
+                        "last_played_at": tr.get("last_played_at"),
+                    }
+                    break
+
+        s["seasons"] = seasons
+        s["season_count"] = len(seasons)
+        s["total_tracks"] = len(all_tracks)
+        s["completed_tracks"] = sum(1 for t in all_tracks if int(t.get("completed") or 0) == 1)
+        s["resume_info"] = resume_info
+        out.append(s)
+
+    return out
+
+
+@router.post("/series")
+async def create_series(
+    req: SeriesCreate,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="合集/系列名称不能为空")
+    level_code = req.level_code.strip()
+    if req.channel == "english" and level_code not in ("L1", "L2", "L3", "L4", "L5"):
+        level_code = "L1"
+    emoji = req.cover_emoji.strip() or _default_channel_emoji(req.channel)
+    ts = now_iso()
+
+    if req.auto_create_first_season:
+        series, first_album = await ensure_series_and_season(
+            channel=req.channel,
+            series_title=title,
+            season_num=1,
+            season_label=req.first_season_label.strip() or _default_season_label(req.channel, 1),
+            level_code=level_code,
+            cover_emoji=emoji,
+            author=req.author.strip(),
+            description=req.description.strip(),
+        )
+        first_album["tracks"] = []
+        first_album["track_count"] = 0
+        series["seasons"] = [first_album]
+        series["season_count"] = 1
+        series["total_tracks"] = 0
+        series["completed_tracks"] = 0
+        series["resume_info"] = None
+        return series
+
+    async with get_db() as conn:
+        try:
+            cur = await conn.execute(
+                """
+                INSERT INTO media_series (title, channel, level_code, cover_emoji, author, description, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (title, req.channel, level_code, emoji, req.author.strip(), req.description.strip(), ts),
+            )
+            await conn.commit()
+            cur2 = await conn.execute("SELECT * FROM media_series WHERE id = ?", (cur.lastrowid,))
+            s = dict(await cur2.fetchone())
+            s["seasons"] = []
+            s["season_count"] = 0
+            s["total_tracks"] = 0
+            s["completed_tracks"] = 0
+            s["resume_info"] = None
+            return s
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"创建系列失败（可能已存在同名合集）: {exc}")
+
+
+@router.patch("/series/{series_id}")
+async def update_series(
+    series_id: int,
+    req: SeriesPatch,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    async with get_db() as conn:
+        cur = await conn.execute("SELECT * FROM media_series WHERE id = ?", (series_id,))
+        row = await cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="系列不存在")
+        data = dict(row)
+        for k, v in req.model_dump(exclude_none=True).items():
+            data[k] = v.strip() if isinstance(v, str) else v
+        await conn.execute(
+            """
+            UPDATE media_series
+            SET title = ?, channel = ?, level_code = ?, cover_emoji = ?, author = ?, description = ?
+            WHERE id = ?
+            """,
+            (
+                data["title"],
+                data["channel"],
+                data.get("level_code", ""),
+                data.get("cover_emoji", ""),
+                data.get("author", ""),
+                data.get("description", ""),
+                series_id,
+            ),
+        )
+        # 同步频道与英语级别至下属季/专辑
+        eng_stage = ENGLISH_LEVEL_TO_STAGE.get(data.get("level_code", ""), "Pre_A1") if data["channel"] == "english" else None
+        if eng_stage:
+            await conn.execute(
+                "UPDATE media_albums SET category = ?, english_level = ? WHERE series_id = ?",
+                (data["channel"], eng_stage, series_id),
+            )
+        else:
+            await conn.execute(
+                "UPDATE media_albums SET category = ? WHERE series_id = ?",
+                (data["channel"], series_id),
+            )
+        await conn.commit()
+    return data
+
+
+@router.delete("/series/{series_id}")
+async def delete_series(
+    series_id: int,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, str]:
+    """删除一级系列及其下属季/专辑和本地音频文件。"""
+    files: list[str] = []
+    async with get_db() as conn:
+        cur_a = await conn.execute("SELECT id FROM media_albums WHERE series_id = ?", (series_id,))
+        aids = [int(r["id"]) for r in await cur_a.fetchall()]
+        if aids:
+            ph = ",".join("?" for _ in aids)
+            cur_f = await conn.execute(f"SELECT file_path FROM media_tracks WHERE album_id IN ({ph})", aids)
+            files = [r["file_path"] for r in await cur_f.fetchall() if r["file_path"]]
+            await conn.execute(f"DELETE FROM media_albums WHERE id IN ({ph})", aids)
+        await conn.execute("DELETE FROM media_series WHERE id = ?", (series_id,))
+        await conn.commit()
+    for fp in files:
+        Path(fp).unlink(missing_ok=True)
+    return {"status": "deleted"}
+
+
+@router.post("/series/{series_id}/seasons")
+async def create_season_under_series(
+    series_id: int,
+    req: SeasonCreate,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """在指定系列下新增一季 / 一张专辑 / 一个英语单元（自动递增季号）。"""
+    async with get_db() as conn:
+        cur_s = await conn.execute("SELECT * FROM media_series WHERE id = ?", (series_id,))
+        srow = await cur_s.fetchone()
+        if not srow:
+            raise HTTPException(status_code=404, detail="所属系列不存在")
+        series = dict(srow)
+        cur_max = await conn.execute(
+            "SELECT COALESCE(MAX(season_num), 0) FROM media_albums WHERE series_id = ?",
+            (series_id,),
+        )
+        next_num = int((await cur_max.fetchone())[0] or 0) + 1
+        snum = int(req.season_num) if req.season_num and req.season_num > 0 else next_num
+        slabel = req.season_label.strip() or _default_season_label(series["channel"], snum)
+        base_title = req.title.strip() or f"{series['title']} · {slabel}"
+        final_title = base_title
+        suffix = 2
+        while True:
+            chk = await conn.execute("SELECT id FROM media_albums WHERE title = ?", (final_title,))
+            if not await chk.fetchone():
+                break
+            final_title = f"{base_title} ({suffix})"
+            suffix += 1
+
+        eng_stage = ENGLISH_LEVEL_TO_STAGE.get(series.get("level_code") or "L1", "Pre_A1") if series["channel"] == "english" else "Pre_A1"
+        cur_ins = await conn.execute(
+            """
+            INSERT INTO media_albums
+            (series_id, season_num, season_label, title, category, sub_tag, age_stage, english_level,
+             play_mode, cover_emoji, author, language, is_inbox, description, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'S6_ALL', ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                series_id,
+                snum,
+                slabel,
+                final_title,
+                series["channel"],
+                series.get("level_code") or slabel,
+                eng_stage,
+                req.play_mode,
+                series.get("cover_emoji") or _default_channel_emoji(series["channel"]),
+                series.get("author") or "",
+                "en" if series["channel"] == "english" else "zh",
+                req.description.strip(),
+                now_iso(),
+            ),
+        )
+        await conn.commit()
+        cur2 = await conn.execute("SELECT * FROM media_albums WHERE id = ?", (cur_ins.lastrowid,))
+        alb = dict(await cur2.fetchone())
+        alb["tracks"] = []
+        alb["track_count"] = 0
+        return alb
+
+
 # -------------------- 专辑与曲目 CRUD --------------------
 
 
@@ -256,15 +615,53 @@ async def create_album(
 ) -> dict[str, Any]:
     if not req.title.strip():
         raise HTTPException(status_code=400, detail="专辑名称不能为空")
+    series_id = req.series_id
+    snum = max(1, int(req.season_num or 1))
+    slabel = req.season_label.strip() or _default_season_label(req.category, snum)
+    ts = now_iso()
     async with get_db() as conn:
         try:
+            if not series_id and not req.is_inbox:
+                level_code = (
+                    ENGLISH_STAGE_TO_LEVEL.get(req.english_level, "L1")
+                    if req.category == "english"
+                    else req.sub_tag.strip()
+                )
+                cur_s = await conn.execute(
+                    "SELECT id FROM media_series WHERE channel = ? AND title = ?",
+                    (req.category, req.title.strip()),
+                )
+                srow = await cur_s.fetchone()
+                if srow:
+                    series_id = int(srow["id"])
+                else:
+                    cur_si = await conn.execute(
+                        """
+                        INSERT INTO media_series (title, channel, level_code, cover_emoji, author, description, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            req.title.strip(),
+                            req.category,
+                            level_code,
+                            req.cover_emoji.strip() or _default_channel_emoji(req.category),
+                            req.author.strip(),
+                            req.description.strip(),
+                            ts,
+                        ),
+                    )
+                    series_id = int(cur_si.lastrowid)
+
             cur = await conn.execute(
                 """
                 INSERT INTO media_albums
-                (title, category, sub_tag, age_stage, english_level, play_mode, cover_emoji, author, language, is_inbox, description, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (series_id, season_num, season_label, title, category, sub_tag, age_stage, english_level, play_mode, cover_emoji, author, language, is_inbox, description, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    series_id,
+                    snum,
+                    slabel,
                     req.title.strip(),
                     req.category,
                     req.sub_tag.strip(),
@@ -276,7 +673,7 @@ async def create_album(
                     req.language.strip() or "zh",
                     1 if req.is_inbox else 0,
                     req.description.strip(),
-                    now_iso(),
+                    ts,
                 ),
             )
             await conn.commit()
@@ -306,11 +703,14 @@ async def update_album(
         await conn.execute(
             """
             UPDATE media_albums
-            SET title = ?, category = ?, sub_tag = ?, age_stage = ?, english_level = ?,
+            SET series_id = ?, season_num = ?, season_label = ?, title = ?, category = ?, sub_tag = ?, age_stage = ?, english_level = ?,
                 play_mode = ?, cover_emoji = ?, author = ?, language = ?, is_inbox = ?, description = ?
             WHERE id = ?
             """,
             (
+                data.get("series_id"),
+                int(data.get("season_num") or 1),
+                data.get("season_label", ""),
                 data["title"],
                 data["category"],
                 data.get("sub_tag", ""),
@@ -437,14 +837,8 @@ async def save_album_progress(
     req: ProgressUpdate,
     _user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
-    async with get_db() as conn:
-        await conn.execute(
-            "UPDATE media_albums SET last_track_id = ?, last_position_sec = ? WHERE id = ?",
-            (req.track_id, req.position_sec, album_id),
-        )
-        await conn.execute("UPDATE media_tracks SET play_count = play_count + 1 WHERE id = ?", (req.track_id,))
-        await conn.commit()
-    return {"status": "saved", "album_id": album_id, "track_id": req.track_id, "position_sec": req.position_sec}
+    res = await update_playback_progress(album_id=album_id, track_id=req.track_id, position_sec=req.position_sec, increment_play=False)
+    return {"status": "saved", **res}
 
 
 @router.post("/tracks/{track_id}/cast")
@@ -460,13 +854,8 @@ async def cast_track_to_speaker(
             raise HTTPException(status_code=404, detail="音频条目不存在")
         track = dict(row)
         track["media_kind"] = "track"
-        await conn.execute("UPDATE media_tracks SET play_count = play_count + 1 WHERE id = ?", (track_id,))
-        await conn.execute(
-            "UPDATE media_albums SET last_track_id = ?, last_position_sec = 0 WHERE id = ?",
-            (track_id, track["album_id"]),
-        )
-        await conn.commit()
 
+    await update_playback_progress(album_id=int(track["album_id"]), track_id=track_id, position_sec=0.0, increment_play=True)
     await device_manager.cast_track_to_device(req.device_id, track)
     return {
         "status": "casted",
@@ -967,6 +1356,28 @@ async def collect_rss(
 
     background_tasks.add_task(run_rss_job, job_id, req.rss_url.strip(), req.album_id, req.limit)
     return {"job_id": job_id, "status": "pending"}
+
+
+@router.post("/collect/ai-collect")
+async def collect_with_ai_classification(
+    req: AiCollectRequest,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """一键全网采集并由 AI 自动分类到「系列 → 季/专辑 → 单集」，完成后音箱播报+网页通知。"""
+    if not req.query.strip():
+        raise HTTPException(status_code=400, detail="请输入要采集的内容名称，如「汪汪队第2季」或「周杰伦」")
+    try:
+        return await enqueue_ai_collect(
+            query=req.query.strip(),
+            channel_hint=req.channel_hint,
+            target_series_id=req.series_id,
+            target_album_id=req.album_id,
+            max_items=req.max_items,
+            device_id=req.device_id.strip(),
+            notify_speaker=req.notify_speaker,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/collect/upload")

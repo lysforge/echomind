@@ -1611,9 +1611,12 @@ async def ingest_uploaded_file(album_id: int, filename: str, content: bytes) -> 
         await conn.commit()
 
     try:
-        track_id = await insert_normalized_track(album_id, title, raw_file, source_url=f"upload://{filename}")
+        from app.services.ai_curator import extract_episode_number_from_title
+
+        ep_num = extract_episode_number_from_title(title)
+        track_id = await insert_normalized_track(album_id, title, raw_file, source_url=f"upload://{filename}", episode_num=ep_num)
         await _update_job(job_id, "done", f"已上传并护耳均衡：{title}", tracks_added=1)
-        return {"job_id": job_id, "track_id": track_id, "title": title}
+        return {"id": track_id, "job_id": job_id, "track_id": track_id, "title": title}
     except Exception as exc:
         await _update_job(job_id, "failed", "上传音频处理失败", error_msg=str(exc)[:300])
         raise

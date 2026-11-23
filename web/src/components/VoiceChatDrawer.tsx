@@ -12,6 +12,7 @@ interface Msg {
   queueItems?: QueueItem[];
   startIdx?: number;
   sourceLabel?: string;
+  bgJobNote?: string;
 }
 
 export function VoiceChatDrawer({
@@ -61,14 +62,23 @@ export function VoiceChatDrawer({
         id: qt.id || 0,
         kind: pt.media_kind === "book_chapter" ? "chapter" : isOnline ? "online" : "track",
         title: qt.title,
-        subtitle: qt.album_title || pt.album_title || sourceLabel,
+        subtitle:
+          pt.series_title && pt.season_label
+            ? `${pt.series_title} · ${pt.season_label}`
+            : qt.album_title || pt.album_title || sourceLabel,
         streamUrl: qt.stream_url || (qt.id > 0 ? `/api/media/tracks/${qt.id}/stream` : res.track_url!),
         parentId: qt.album_id || 0,
         durationSec: qt.duration_sec || 0,
+        startPositionSec: qt.id === pt.id ? pt.start_position_sec || 0 : 0,
+        episodeNum: qt.episode_num,
       }));
       const foundIdx = queueItems.findIndex((x) => x.id === pt.id && x.title === pt.title);
       startIdx = foundIdx >= 0 ? foundIdx : 0;
     }
+
+    const bgJobNote = res.background_job
+      ? `后台采集任务 #${res.background_job.job_id} 已启动：${res.background_job.preview?.series_title || res.background_job.query} ${res.background_job.preview?.season_label || ""}（完成后自动分类并播报）`
+      : undefined;
 
     setMessages((p) => [
       ...p,
@@ -82,6 +92,7 @@ export function VoiceChatDrawer({
         queueItems,
         startIdx,
         sourceLabel,
+        bgJobNote,
       },
     ]);
 
@@ -193,9 +204,18 @@ export function VoiceChatDrawer({
         <div className="flex-1 space-y-3 overflow-y-auto rounded-2xl bg-zinc-50 p-3">
           {messages.length === 0 && (
             <div className="space-y-2 text-xs text-[var(--ink-muted)]">
-              <p>快捷语音指令体验（支持点播、续播、切集、调音量、睡眠定时）：</p>
+              <p>快捷语音指令体验（支持语音采集自动分类、跳季跳集、续播、调音量、睡眠定时）：</p>
               <div className="flex flex-wrap gap-1.5">
-                {["播放小星星", "放点哄睡轻音乐", "讲个三只小猪的故事", "下一首", "音量调到 45", "20分钟后停止", "暂停播放", "继续播放"].map((q) => (
+                {[
+                  "帮我采集汪汪队第二季的故事",
+                  "播放汪汪队",
+                  "播放汪汪队第2季第1集",
+                  "跳到第2集",
+                  "继续学L1英语",
+                  "帮我下载周杰伦的歌",
+                  "音量调到 45",
+                  "20分钟后停止",
+                ].map((q) => (
                   <button
                     key={q}
                     onClick={() => setInput(q)}
@@ -215,6 +235,11 @@ export function VoiceChatDrawer({
                 }`}
               >
                 {m.text}
+                {m.bgJobNote && (
+                  <div className="mt-2 rounded-xl bg-amber-50 px-2.5 py-1.5 text-[11px] font-semibold text-amber-800">
+                    ✨ {m.bgJobNote}
+                  </div>
+                )}
                 {m.queueItems && m.queueItems[m.startIdx || 0] && (
                   <button
                     onClick={() => {

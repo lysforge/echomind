@@ -211,9 +211,15 @@ class DeviceConnectionManager:
             except Exception:
                 pass
 
-    async def cast_track_to_device(self, device_id: str, track: dict[str, Any]) -> None:
+    async def cast_track_to_device(
+        self,
+        device_id: str,
+        track: dict[str, Any],
+        start_position_sec: float = 0.0,
+    ) -> None:
         title = str(track.get("title", "未知音频"))
         track_url = _resolve_stream_url(track)
+        pos = max(0.0, float(start_position_sec or 0.0))
         await self.update_device_state(device_id, playing_title=f"正在播放：{title}")
 
         await self.broadcast_web(
@@ -222,6 +228,7 @@ class DeviceConnectionManager:
                 "device_id": device_id,
                 "track": track,
                 "track_url": track_url,
+                "start_position_sec": pos,
                 "timestamp": now_iso(),
             }
         )
@@ -230,7 +237,15 @@ class DeviceConnectionManager:
         if spk_ws and track_url:
             try:
                 await spk_ws.send_text(
-                    json.dumps({"type": "play_url", "title": title, "track_url": track_url}, ensure_ascii=False)
+                    json.dumps(
+                        {
+                            "type": "play_url",
+                            "title": title,
+                            "track_url": track_url,
+                            "start_position_sec": pos,
+                        },
+                        ensure_ascii=False,
+                    )
                 )
             except Exception:
                 pass
@@ -309,6 +324,80 @@ class DeviceConnectionManager:
         except asyncio.CancelledError:
             return
 
+    async def _sync_series_album_progress(
+        self,
+        album_id: int | None,
+        track_id: int,
+        position_sec: float = 0.0,
+        increment_play: bool = True,
+    ) -> None:
+        """统一同步单集、季/专辑与一级系列的最新播放位置。"""
+        if not album_id or track_id <= 0:
+            return
+        ts = now_iso()
+        pos = max(0.0, float(position_sec or 0.0))
+        async with get_db() as conn:
+            if increment_play:
+                await conn.execute(
+                    "UPDATE media_tracks SET play_count = play_count + 1, last_position_sec = ?, last_played_at = ? WHERE id = ?",
+                    (pos, ts, track_id),
+                )
+            else:
+                await conn.execute(
+                    "UPDATE media_tracks SET last_position_sec = ?, last_played_at = ? WHERE id = ?",
+                    (pos, ts, track_id),
+                )
+            await conn.execute(
+                "UPDATE media_albums SET last_track_id = ?, last_position_sec = ? WHERE id = ?",
+                (track_id, pos, album_id),
+            )
+            cur_a = await conn.execute("SELECT series_id FROM media_albums WHERE id = ?", (album_id,))
+            arow = await cur_a.fetchone()
+            if arow and arow["series_id"]:
+                await conn.execute(
+                    """
+                    UPDATE media_series
+                    SET last_album_id = ?, last_track_id = ?, last_position_sec = ?, last_played_at = ?
+                    WHERE id = ?
+                    """,
+                    (album_id, track_id, pos, ts, int(arow["series_id"])),
+                )
+            await conn.commit()
+
+    async def _find_next_season_in_series(
+        self,
+        series_id: int,
+        current_album_id: int,
+        current_season_num: int,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+        """在同系列下查找下一季及其可播放单集队列，支持播完本季最后一集后自动跨季连播。"""
+        async with get_db() as conn:
+            cur = await conn.execute(
+                """
+                SELECT * FROM media_albums
+                WHERE series_id = ? AND is_inbox = 0
+                  AND (season_num > ? OR (season_num = ? AND id > ?))
+                ORDER BY season_num ASC, id ASC
+                """,
+                (series_id, current_season_num, current_season_num, current_album_id),
+            )
+            candidates = [dict(r) for r in await cur.fetchall()]
+            for alb in candidates:
+                cur_t = await conn.execute(
+                    "SELECT * FROM media_tracks WHERE album_id = ? ORDER BY episode_num ASC, id ASC",
+                    (alb["id"],),
+                )
+                tracks = []
+                for r in await cur_t.fetchall():
+                    d = dict(r)
+                    d["album_title"] = alb["title"]
+                    d["media_kind"] = "track"
+                    d["stream_url"] = f"/api/media/tracks/{d['id']}/stream"
+                    tracks.append(d)
+                if tracks:
+                    return alb, tracks
+        return None
+
     async def push_queue_to_device(
         self,
         device_id: str,
@@ -319,8 +408,10 @@ class DeviceConnectionManager:
         loop_mode: str = "sequential",
         sleep_minutes: int | None = None,
         sleep_episodes: int | None = None,
+        series_id: int | None = None,
+        start_position_sec: float = 0.0,
     ) -> dict[str, Any]:
-        """在服务端为指定音箱建立连播队列会话并立即下发首集播放。"""
+        """在服务端为指定音箱建立连播队列会话并立即下发首集播放（支持断点秒数与跨季元数据）。"""
         if not tracks:
             raise ValueError("推送队列为空")
         self._cancel_session_watcher(device_id)
@@ -332,13 +423,37 @@ class DeviceConnectionManager:
             d["stream_url"] = _resolve_stream_url(d)
             sanitized.append(d)
 
+        resolved_album_id = album_id or sanitized[idx].get("album_id")
+        resolved_series_id = series_id
+        season_num = 1
+        season_label = ""
+        if resolved_album_id:
+            async with get_db() as conn:
+                cur_a = await conn.execute(
+                    "SELECT series_id, season_num, season_label, title FROM media_albums WHERE id = ?",
+                    (resolved_album_id,),
+                )
+                arow = await cur_a.fetchone()
+                if arow:
+                    if resolved_series_id is None and arow["series_id"]:
+                        resolved_series_id = int(arow["series_id"])
+                    season_num = int(arow["season_num"] or 1)
+                    season_label = str(arow["season_label"] or "")
+                    if not album_title:
+                        album_title = str(arow["title"] or "")
+
+        pos = max(0.0, float(start_position_sec or 0.0))
         sleep_until = (time.time() + max(1, int(sleep_minutes)) * 60) if sleep_minutes else None
         sess: dict[str, Any] = {
             "device_id": device_id,
-            "album_id": album_id,
+            "series_id": resolved_series_id,
+            "season_num": season_num,
+            "season_label": season_label,
+            "album_id": resolved_album_id,
             "album_title": album_title or str(sanitized[idx].get("album_title") or ""),
             "queue": sanitized,
             "current_index": idx,
+            "start_position_sec": pos,
             "status": "playing",
             "loop_mode": loop_mode if loop_mode in ("sequential", "repeat_one", "shuffle") else "sequential",
             "sleep_until_ts": sleep_until,
@@ -350,13 +465,10 @@ class DeviceConnectionManager:
         self.playback_sessions[device_id] = sess
 
         cur_tr = sanitized[idx]
-        if album_id and int(cur_tr.get("id") or 0) > 0:
-            async with get_db() as conn:
-                await conn.execute("UPDATE media_tracks SET play_count = play_count + 1 WHERE id = ?", (cur_tr["id"],))
-                await conn.execute("UPDATE media_albums SET last_track_id = ?, last_position_sec = 0 WHERE id = ?", (cur_tr["id"], album_id))
-                await conn.commit()
+        if resolved_album_id and int(cur_tr.get("id") or 0) > 0:
+            await self._sync_series_album_progress(int(resolved_album_id), int(cur_tr["id"]), position_sec=pos, increment_play=True)
 
-        await self.cast_track_to_device(device_id, cur_tr)
+        await self.cast_track_to_device(device_id, cur_tr, start_position_sec=pos)
         sess["auto_task"] = asyncio.create_task(self._auto_advance_watcher(device_id))
         await self.broadcast_web({"type": "playback_session", "device_id": device_id})
         return await self.get_room_playback_snapshot_by_id(device_id)
@@ -367,7 +479,7 @@ class DeviceConnectionManager:
         delta: int = 1,
         auto_triggered: bool = False,
     ) -> dict[str, Any] | None:
-        """推进或回退指定音箱的连播队列，支持按集数睡眠定时截停。"""
+        """推进或回退指定音箱的连播队列，支持按集数睡眠定时截停与同系列跨季自动顺延连播。"""
         sess = self.playback_sessions.get(device_id)
         if not sess or not sess.get("queue"):
             return None
@@ -383,6 +495,38 @@ class DeviceConnectionManager:
         cur = int(sess.get("current_index") or 0)
         loop_mode = sess.get("loop_mode", "sequential")
 
+        # 同系列跨季无缝连播：顺序模式下播完本季最后一集，自动接续下一季第 1 集
+        if (
+            delta > 0
+            and loop_mode == "sequential"
+            and cur + delta >= len(queue)
+            and sess.get("series_id")
+            and sess.get("album_id")
+        ):
+            nxt_season = await self._find_next_season_in_series(
+                series_id=int(sess["series_id"]),
+                current_album_id=int(sess["album_id"]),
+                current_season_num=int(sess.get("season_num") or 1),
+            )
+            if nxt_season:
+                next_alb, next_tracks = nxt_season
+                sess["album_id"] = int(next_alb["id"])
+                sess["album_title"] = str(next_alb["title"])
+                sess["season_num"] = int(next_alb.get("season_num") or 1)
+                sess["season_label"] = str(next_alb.get("season_label") or "")
+                sess["queue"] = next_tracks
+                sess["current_index"] = 0
+                sess["start_position_sec"] = 0.0
+                sess["status"] = "playing"
+                sess["started_at"] = time.time()
+                next_tr = next_tracks[0]
+                if int(next_tr.get("id") or 0) > 0:
+                    await self._sync_series_album_progress(int(next_alb["id"]), int(next_tr["id"]), position_sec=0.0, increment_play=True)
+                await self.cast_track_to_device(device_id, next_tr, start_position_sec=0.0)
+                sess["auto_task"] = asyncio.create_task(self._auto_advance_watcher(device_id))
+                await self.broadcast_web({"type": "playback_session", "device_id": device_id})
+                return await self.get_room_playback_snapshot_by_id(device_id)
+
         if auto_triggered and loop_mode == "repeat_one":
             next_idx = cur
         elif loop_mode == "shuffle" and len(queue) > 1:
@@ -392,18 +536,16 @@ class DeviceConnectionManager:
             next_idx = (cur + delta) % len(queue)
 
         sess["current_index"] = next_idx
+        sess["start_position_sec"] = 0.0
         sess["status"] = "playing"
         sess["started_at"] = time.time()
         next_tr = queue[next_idx]
 
         album_id = sess.get("album_id")
         if album_id and int(next_tr.get("id") or 0) > 0:
-            async with get_db() as conn:
-                await conn.execute("UPDATE media_tracks SET play_count = play_count + 1 WHERE id = ?", (next_tr["id"],))
-                await conn.execute("UPDATE media_albums SET last_track_id = ?, last_position_sec = 0 WHERE id = ?", (next_tr["id"], album_id))
-                await conn.commit()
+            await self._sync_series_album_progress(int(album_id), int(next_tr["id"]), position_sec=0.0, increment_play=True)
 
-        await self.cast_track_to_device(device_id, next_tr)
+        await self.cast_track_to_device(device_id, next_tr, start_position_sec=0.0)
         sess["auto_task"] = asyncio.create_task(self._auto_advance_watcher(device_id))
         await self.broadcast_web({"type": "playback_session", "device_id": device_id})
         return await self.get_room_playback_snapshot_by_id(device_id)
@@ -430,10 +572,13 @@ class DeviceConnectionManager:
         if action == "jump" and sess and index is not None and 0 <= index < len(sess["queue"]):
             self._cancel_session_watcher(device_id)
             sess["current_index"] = index
+            sess["start_position_sec"] = 0.0
             sess["status"] = "playing"
             sess["started_at"] = time.time()
             tr = sess["queue"][index]
-            await self.cast_track_to_device(device_id, tr)
+            if sess.get("album_id") and int(tr.get("id") or 0) > 0:
+                await self._sync_series_album_progress(int(sess["album_id"]), int(tr["id"]), position_sec=0.0, increment_play=True)
+            await self.cast_track_to_device(device_id, tr, start_position_sec=0.0)
             sess["auto_task"] = asyncio.create_task(self._auto_advance_watcher(device_id))
         elif action == "pause":
             self._cancel_session_watcher(device_id)
@@ -487,14 +632,19 @@ class DeviceConnectionManager:
         cur_tr = queue[cur_idx] if 0 <= cur_idx < len(queue) else None
 
         res["session"] = {
+            "series_id": sess.get("series_id"),
+            "season_num": sess.get("season_num", 1),
+            "season_label": sess.get("season_label", ""),
             "album_id": sess.get("album_id"),
             "album_title": sess.get("album_title", ""),
             "status": sess.get("status", "stopped"),
             "loop_mode": sess.get("loop_mode", "sequential"),
             "current_index": cur_idx,
+            "start_position_sec": float(sess.get("start_position_sec") or 0.0),
             "current_track": {
                 "id": cur_tr.get("id"),
                 "title": cur_tr.get("title"),
+                "episode_num": cur_tr.get("episode_num", cur_idx + 1),
                 "duration_sec": cur_tr.get("duration_sec", 0),
                 "stream_url": cur_tr.get("stream_url"),
             }
@@ -504,10 +654,11 @@ class DeviceConnectionManager:
                 {
                     "id": q.get("id"),
                     "title": q.get("title"),
+                    "episode_num": q.get("episode_num", i + 1),
                     "duration_sec": q.get("duration_sec", 0),
                     "stream_url": q.get("stream_url"),
                 }
-                for q in queue
+                for i, q in enumerate(queue)
             ],
             "sleep_remaining_sec": rem_sec,
             "sleep_remaining_episodes": rem_eps,

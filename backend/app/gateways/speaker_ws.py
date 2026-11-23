@@ -92,6 +92,8 @@ async def speaker_ws_endpoint(websocket: WebSocket) -> None:
                     album_id=brain_resp.play_track.get("album_id"),
                     album_title=str(brain_resp.play_track.get("album_title") or ""),
                     start_index=idx,
+                    series_id=brain_resp.play_track.get("series_id"),
+                    start_position_sec=float(brain_resp.play_track.get("start_position_sec") or 0.0),
                 )
 
             payload = {
@@ -103,6 +105,8 @@ async def speaker_ws_endpoint(websocket: WebSocket) -> None:
                 "tts_url": f"/api/tts-cache/{tts_path.name}",
                 "track_url": _resolve_stream_url(brain_resp.play_track),
                 "track": brain_resp.play_track,
+                "start_position_sec": float((brain_resp.play_track or {}).get("start_position_sec") or 0.0),
+                "background_job": brain_resp.background_job,
             }
             await websocket.send_text(json.dumps(payload, ensure_ascii=False))
 

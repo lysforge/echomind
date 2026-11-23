@@ -10,6 +10,10 @@ export interface QueueItem {
   streamUrl: string;
   parentId: number;
   durationSec: number;
+  startPositionSec?: number;
+  episodeNum?: number;
+  seasonLabel?: string;
+  seriesTitle?: string;
 }
 
 function fmtTime(sec: number): string {

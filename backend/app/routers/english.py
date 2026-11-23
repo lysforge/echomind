@@ -13,6 +13,7 @@ from app.auth import get_current_user
 from app.config import load_settings
 from app.db import get_db, now_iso
 from app.gateways.manager import device_manager
+from app.services.collector import sync_legacy_to_unified_albums
 from app.services.english_courses import (
     generate_custom_english_course,
     get_course_detail,
@@ -57,6 +58,12 @@ class LessonPlayRequest(BaseModel):
 
 class LessonPatchRequest(BaseModel):
     completed: bool | None = None
+
+
+class PronounceRequest(BaseModel):
+    text: str
+    rate: str = "-8%"
+    device_id: str = ""
 
 
 # -------------------- 结构化系列课程 (Courses & Lessons) --------------------
@@ -104,8 +111,10 @@ async def list_english_courses(
 async def seed_courses_endpoint(
     _user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, int]:
-    """幂等导入内置 6 套 24 节全阶英语系列课程（Pre-A1 -> B2+）。"""
-    return await seed_builtin_english_courses()
+    """幂等导入内置 6 套 24 节全阶英语系列课程（Pre-A1 -> B2+）并同步至统一分级媒体库。"""
+    res = await seed_builtin_english_courses()
+    await sync_legacy_to_unified_albums()
+    return res
 
 
 @router.post("/courses/generate")
@@ -115,7 +124,24 @@ async def generate_course_endpoint(
 ) -> dict[str, Any]:
     if not req.topic.strip():
         raise HTTPException(status_code=400, detail="请输入感兴趣的课程主题")
-    return await generate_custom_english_course(req.topic.strip(), req.stage)
+    course = await generate_custom_english_course(req.topic.strip(), req.stage)
+    await sync_legacy_to_unified_albums()
+    return course
+
+
+@router.post("/pronounce")
+async def pronounce_english_word(
+    req: PronounceRequest,
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    """英语启蒙词卡/例句即时点读发音（可选同时推音箱跟读）。"""
+    txt = req.text.strip()
+    if not txt:
+        raise HTTPException(status_code=400, detail="点读内容不能为空")
+    tts_path = await synthesize_speech(txt, voice="en-US-AriaNeural", rate=req.rate or "-8%")
+    if req.device_id.strip():
+        await device_manager.push_announcement(req.device_id.strip(), txt, tts_path=tts_path)
+    return {"text": txt, "tts_url": f"/api/tts-cache/{tts_path.name}"}
 
 
 @router.get("/courses/{course_id}")

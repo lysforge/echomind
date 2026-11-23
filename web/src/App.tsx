@@ -1,20 +1,17 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ArrowLeft,
-  Compass,
+  Bell,
+  BookOpen,
   Disc3,
-  FolderInput,
-  Library,
+  GraduationCap,
   LogOut,
   Menu,
   MessageSquareHeart,
   Mic,
   Moon,
-  Settings,
-  ShieldCheck,
+  Radio,
   Speaker,
-  Users,
-  Wrench,
+  Volume2,
   X,
 } from "lucide-react";
 import { api, AuthUser, DashboardData, setOnUnauthorized, setStoredToken } from "./api";
@@ -22,18 +19,24 @@ import { PlayerBar, QueueItem } from "./components/PlayerBar";
 import { ThemeSwitcher } from "./components/ThemeSwitcher";
 import { VoiceChatDrawer } from "./components/VoiceChatDrawer";
 import { AuthPage } from "./pages/AuthPage";
-import { CloudMusicPage } from "./pages/CloudMusicPage";
-import { ExplorePage } from "./pages/ExplorePage";
-import { FamilyPage } from "./pages/FamilyPage";
+import { ChannelWorkspacePage } from "./pages/ChannelWorkspacePage";
+import { EnglishEnlightenmentPage } from "./pages/EnglishEnlightenmentPage";
+import { HubSettingsPage } from "./pages/HubSettingsPage";
 import { OnboardingModal } from "./pages/OnboardingModal";
-import { RoomsControlPage } from "./pages/RoomsControlPage";
-import { StudioCatalogPage } from "./pages/StudioCatalogPage";
-import { StudioIngestPage } from "./pages/StudioIngestPage";
-import { StudioSystemPage } from "./pages/StudioSystemPage";
 
-type WorkspaceMode = "front" | "studio";
-type FrontTab = "explore" | "cloud" | "rooms" | "family";
-type StudioTab = "catalog" | "ingest" | "system";
+type MainNavTab = "story" | "music" | "english" | "podcast" | "hub";
+
+interface CollectBanner {
+  id: number;
+  status: string;
+  channel: "story" | "music" | "english" | "podcast";
+  series_id?: number | null;
+  series_title: string;
+  season_label: string;
+  tracks_added: number;
+  summary_text: string;
+  tts_url?: string | null;
+}
 
 export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
@@ -41,15 +44,16 @@ export default function App() {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
 
-  // 前后台双空间导航
-  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("front");
-  const [frontTab, setFrontTab] = useState<FrontTab>("explore");
-  const [studioTab, setStudioTab] = useState<StudioTab>("catalog");
-  const [studioFocusAlbumId, setStudioFocusAlbumId] = useState<number | null>(null);
+  // 极简统一 5 导航（彻底取消前后台割裂切换）
+  const [activeTab, setActiveTab] = useState<MainNavTab>("story");
+  const [hubSubTab, setHubSubTab] = useState<"rooms" | "family" | "tasks" | "system">("rooms");
+  const [focusSeriesId, setFocusSeriesId] = useState<number | null>(null);
+  const [refreshSignal, setRefreshSignal] = useState(0);
 
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [voiceDrawerOpen, setVoiceDrawerOpen] = useState(false);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
+  const [collectBanner, setCollectBanner] = useState<CollectBanner | null>(null);
 
   // Toast 通知
   const [toast, setToast] = useState<string>("");
@@ -57,7 +61,7 @@ export default function App() {
   const showToast = useCallback((msg: string) => {
     setToast(msg);
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
-    toastTimerRef.current = window.setTimeout(() => setToast(""), 3600);
+    toastTimerRef.current = window.setTimeout(() => setToast(""), 3800);
   }, []);
 
   // 全局播放状态
@@ -71,10 +75,10 @@ export default function App() {
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const pendingSeekRef = useRef<number>(0);
   const lastProgressSyncRef = useRef<number>(0);
   const browserSleepTimerRef = useRef<number | null>(null);
 
-  // 刷新仪表盘数据
   const fetchDashboard = useCallback(async () => {
     try {
       const data = await api.getDashboard();
@@ -113,14 +117,7 @@ export default function App() {
     }
   }, [user, fetchDashboard]);
 
-  // 非管理员禁止停留于后台模式
-  useEffect(() => {
-    if (user && user.role !== "admin" && workspaceMode === "studio") {
-      setWorkspaceMode("front");
-    }
-  }, [user, workspaceMode]);
-
-  // 播放短语音 / 试听音（支持播放结束回调）
+  // 播放短语音 / 试听音 / 词卡点读
   const playSingleUrl = useCallback(
     (url: string, onEnded?: () => void) => {
       if (!url) {
@@ -143,15 +140,75 @@ export default function App() {
     [showToast]
   );
 
-  // 启动某一队列下标播放（浏览器或音箱连接队列推送）
+  // 全局 /ws/web 实时推送：接收语音采集完成 & AI 自动分类通知、房间播控同步
+  useEffect(() => {
+    if (!user) return;
+    let ws: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
+    let closed = false;
+
+    const connect = () => {
+      if (closed) return;
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${proto}//${window.location.host}/ws/web`;
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === "collect_completed") {
+              setCollectBanner({
+                id: msg.job_id || Date.now(),
+                status: msg.status || "done",
+                channel: msg.channel || "story",
+                series_id: msg.series_id ?? null,
+                series_title: msg.series_title || msg.query || "采集任务",
+                season_label: msg.season_label || "",
+                tracks_added: Number(msg.tracks_added || 0),
+                summary_text: msg.summary_text || "采集与 AI 自动分类已完成",
+                tts_url: msg.tts_url || null,
+              });
+              setRefreshSignal((n) => n + 1);
+              void fetchDashboard();
+              // 若非实体音箱发起（网页端发起的采集），自动播报温柔语音提示
+              if (msg.tts_url && (!msg.device_id || msg.device_id === "web-console")) {
+                playSingleUrl(msg.tts_url);
+              }
+            } else if (msg.type === "device_discovered" || msg.type === "device_state" || msg.type === "playback_session") {
+              void fetchDashboard();
+            }
+          } catch {
+            // ignore malformed ws message
+          }
+        };
+        ws.onclose = () => {
+          if (!closed) {
+            reconnectTimer = window.setTimeout(connect, 4000);
+          }
+        };
+      } catch {
+        reconnectTimer = window.setTimeout(connect, 5000);
+      }
+    };
+
+    connect();
+    return () => {
+      closed = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      ws?.close();
+    };
+  }, [user, fetchDashboard, playSingleUrl]);
+
+  // 启动某一队列下标播放（浏览器支持精确断点秒数续播，或推音箱连播队列）
   const activateItemAt = useCallback(
     async (items: QueueItem[], idx: number, targetOverride?: string) => {
       const item = items[idx];
       if (!item) return;
       const target = targetOverride ?? outputTarget;
+      const startPos = Math.max(0, Number(item.startPositionSec || 0));
       setQueue(items);
       setCurrentIndex(idx);
-      setProgressSec(0);
+      setProgressSec(startPos);
       setDurationSec(item.durationSec || 0);
 
       if (target !== "browser") {
@@ -163,6 +220,8 @@ export default function App() {
               device_ids: [target],
               album_id: item.parentId,
               start_index: idx,
+              start_position_sec: startPos,
+              resume: false,
               loop_mode: loopMode,
             });
           } else if (item.kind === "track" && item.id > 0) {
@@ -170,6 +229,7 @@ export default function App() {
           } else {
             showToast("在线实时流先为您通过本机浏览器播放");
             if (audioRef.current) {
+              pendingSeekRef.current = 0;
               audioRef.current.src = item.streamUrl;
               void audioRef.current.play().then(() => setIsPlaying(true));
             }
@@ -186,11 +246,17 @@ export default function App() {
       }
 
       if (audioRef.current) {
+        pendingSeekRef.current = startPos;
         audioRef.current.src = item.streamUrl;
-        audioRef.current.currentTime = 0;
+        audioRef.current.currentTime = startPos;
         audioRef.current
           .play()
-          .then(() => setIsPlaying(true))
+          .then(() => {
+            setIsPlaying(true);
+            if (item.kind === "track" && item.id > 0 && item.parentId > 0) {
+              void api.saveProgress(item.parentId, item.id, startPos).catch(() => undefined);
+            }
+          })
           .catch((e) => {
             setIsPlaying(false);
             showToast(`浏览器播放失败: ${(e as Error).message}`);
@@ -219,7 +285,9 @@ export default function App() {
         if (nextIdx >= queue.length) nextIdx = 0;
         if (nextIdx < 0) nextIdx = queue.length - 1;
       }
-      void activateItemAt(queue, nextIdx);
+      // 切到下一首时归零 startPositionSec，避免复用上一首的断点
+      const nextQueue = queue.map((q, i) => (i === nextIdx ? { ...q, startPositionSec: 0 } : q));
+      void activateItemAt(nextQueue, nextIdx);
     },
     [outputTarget, queue, currentIndex, loopMode, activateItemAt, fetchDashboard, showToast]
   );
@@ -253,7 +321,7 @@ export default function App() {
     }
   };
 
-  // 响应网页语音对讲的即时播控指令
+  // 响应网页语音对讲的即时播控指令（含精准跳集）
   const handleVoiceControlAction = (
     ctrl: NonNullable<Awaited<ReturnType<typeof api.interact>>["control_action"]>
   ) => {
@@ -269,6 +337,14 @@ export default function App() {
       handleStep(1);
     } else if (act === "prev") {
       handleStep(-1);
+    } else if (act === "jump") {
+      if (typeof ctrl.index === "number" && ctrl.index >= 0 && ctrl.index < queue.length) {
+        void activateItemAt(queue, ctrl.index);
+      } else if (typeof ctrl.episode_num === "number") {
+        const idx = queue.findIndex((q) => q.episodeNum === ctrl.episode_num);
+        if (idx >= 0) void activateItemAt(queue, idx);
+        else if (ctrl.episode_num >= 1 && ctrl.episode_num <= queue.length) void activateItemAt(queue, ctrl.episode_num - 1);
+      }
     } else if (act === "volume_set" && typeof ctrl.value === "number") {
       if (audioRef.current) audioRef.current.volume = Math.max(0, Math.min(1, ctrl.value / 100));
     } else if (act === "volume_delta" && typeof ctrl.delta === "number") {
@@ -289,6 +365,10 @@ export default function App() {
     setProgressSec(sec);
     if (audioRef.current && outputTarget === "browser") {
       audioRef.current.currentTime = sec;
+      const cur = queue[currentIndex];
+      if (cur && cur.kind === "track" && cur.id > 0 && cur.parentId > 0) {
+        void api.saveProgress(cur.parentId, cur.id, sec).catch(() => undefined);
+      }
     }
   };
 
@@ -342,8 +422,7 @@ export default function App() {
         onSuccess={(loggedUser) => {
           setUser(loggedUser);
           setInitialized(true);
-          setWorkspaceMode("front");
-          setFrontTab("explore");
+          setActiveTab("story");
         }}
       />
     );
@@ -361,45 +440,29 @@ export default function App() {
     dashboard!.devices.length === 0 &&
     dashboard!.members.length === 0;
 
-  const frontNavItems: Array<{ id: FrontTab; label: string; icon: React.ReactNode; badge?: string | number }> = [
-    { id: "explore", label: "私有曲库与播客", icon: <Compass className="h-4 w-4" /> },
-    { id: "cloud", label: "无限听歌与下歌", icon: <Disc3 className="h-4 w-4" /> },
+  const navItems: Array<{ id: MainNavTab; label: string; hint: string; icon: React.ReactNode; badge?: string | number }> = [
+    { id: "story", label: "故事书架", hint: "合集 · 季 · 集续播", icon: <BookOpen className="h-4 w-4" /> },
+    { id: "music", label: "音乐曲库", hint: "私有歌单与无限下歌", icon: <Disc3 className="h-4 w-4" /> },
+    { id: "english", label: "英语启蒙", hint: "L1-L5分级与点读", icon: <GraduationCap className="h-4 w-4" /> },
+    { id: "podcast", label: "播客电台", hint: "RSS 订阅与续听", icon: <Radio className="h-4 w-4" /> },
     {
-      id: "rooms",
-      label: "房间音箱与定时",
+      id: "hub",
+      label: "音箱与设置",
+      hint: "推送 · 定时 · 家人 · 系统",
       icon: <Speaker className="h-4 w-4" />,
       badge: pendingCount > 0 ? `待认领 ${pendingCount}` : onlineSpeakers > 0 ? `${onlineSpeakers} 在线` : undefined,
     },
-    {
-      id: "family",
-      label: "家人声纹与记忆",
-      icon: <Users className="h-4 w-4" />,
-      badge: dashboard && dashboard.members.length > 0 ? dashboard.members.length : undefined,
-    },
   ];
 
-  const studioNavItems: Array<{ id: StudioTab; label: string; icon: React.ReactNode }> = [
-    { id: "catalog", label: "专辑编目与分类", icon: <Library className="h-4 w-4" /> },
-    { id: "ingest", label: "五大内容填充中心", icon: <FolderInput className="h-4 w-4" /> },
-    { id: "system", label: "硬件 · 账号 · 系统设置", icon: <Settings className="h-4 w-4" /> },
-  ];
-
-  const currentHeaderTitle =
-    workspaceMode === "front"
-      ? frontNavItems.find((n) => n.id === frontTab)?.label || "私有曲库与播客"
-      : studioNavItems.find((n) => n.id === studioTab)?.label || "管理工作台";
+  const currentHeaderTitle = navItems.find((n) => n.id === activeTab)?.label || "故事书架";
 
   const renderSidebarContent = () => (
     <div className="flex h-full flex-col justify-between p-4">
       <div className="space-y-5 overflow-y-auto">
         {/* 品牌头 */}
         <div className="flex items-center gap-3 px-2 pt-1">
-          <div
-            className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl shadow-sm ${
-              workspaceMode === "studio" ? "bg-[var(--ink-primary)] text-[var(--bg-card)]" : "bg-[var(--brand-green)] text-white"
-            }`}
-          >
-            {workspaceMode === "studio" ? <Wrench className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[var(--brand-primary)] text-white shadow-sm">
+            <Mic className="h-5 w-5" />
           </div>
           <div className="min-w-0">
             <div className="flex items-baseline gap-1.5">
@@ -407,113 +470,74 @@ export default function App() {
               <span className="text-[11px] font-medium text-[var(--ink-muted)]">· 声忆</span>
             </div>
             <div className="truncate text-xs text-[var(--ink-muted)]">
-              {workspaceMode === "studio" ? "内容工坊与管理后台" : `${dashboard?.home_name || "我的家"} · 助手「${dashboard?.assistant_name || "小音"}」`}
+              {dashboard?.home_name || "我的家"} · 助手「{dashboard?.assistant_name || "小音"}」
             </div>
           </div>
         </div>
 
-        {/* 前台模式：极简 3 栏 */}
-        {workspaceMode === "front" ? (
-          <div>
-            <div className="mb-1.5 px-3 text-[11px] font-bold tracking-wider text-[var(--ink-muted)] uppercase">
-              家庭听音与播控
-            </div>
-            <div className="space-y-1">
-              {frontNavItems.map((item) => {
-                const active = frontTab === item.id;
-                return (
-                  <button
-                    key={item.id}
-                    onClick={() => {
-                      setFrontTab(item.id);
-                      setMobileNavOpen(false);
-                    }}
-                    className={`flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-sm font-semibold transition ${
-                      active ? "bg-[var(--brand-green)] text-white shadow-xs" : "text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)]"
+        {/* 极简 5 导航 */}
+        <div className="space-y-1.5">
+          {navItems.map((item) => {
+            const active = activeTab === item.id;
+            return (
+              <button
+                key={item.id}
+                onClick={() => {
+                  setActiveTab(item.id);
+                  setMobileNavOpen(false);
+                }}
+                className={`flex w-full items-center justify-between rounded-2xl px-3.5 py-2.5 text-left transition ${
+                  active
+                    ? "bg-[var(--brand-primary)] text-white shadow-xs"
+                    : "text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)]"
+                }`}
+              >
+                <span className="flex items-center gap-2.5 min-w-0">
+                  {item.icon}
+                  <span className="min-w-0">
+                    <span className="block text-sm font-bold leading-tight">{item.label}</span>
+                    <span className={`block truncate text-[10px] mt-0.5 ${active ? "text-white/80" : "text-[var(--ink-muted)]"}`}>
+                      {item.hint}
+                    </span>
+                  </span>
+                </span>
+                {item.badge !== undefined && (
+                  <span
+                    className={`ml-2 shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                      active ? "bg-white/20 text-white" : "bg-[var(--brand-green-soft)] text-[var(--brand-primary)]"
                     }`}
                   >
-                    <span className="flex items-center gap-2.5">
-                      {item.icon}
-                      <span>{item.label}</span>
-                    </span>
-                    {item.badge !== undefined && (
-                      <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${active ? "bg-white/20 text-white" : "bg-[var(--bg-subtle)] text-[var(--ink-secondary)]"}`}>
-                        {item.badge}
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        ) : (
-          /* 后台模式：返回按钮 + 专业 3 栏管理 */
-          <div className="space-y-4">
-            <button
-              onClick={() => {
-                setWorkspaceMode("front");
-                setMobileNavOpen(false);
-              }}
-              className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-[var(--brand-green)] bg-[var(--brand-green-soft)] px-3 py-2 text-xs font-bold text-[var(--brand-green)] hover:bg-[var(--brand-primary-soft-hover)]"
-            >
-              <ArrowLeft className="h-3.5 w-3.5" /> 返回家庭听音台
-            </button>
-
-            <div>
-              <div className="mb-1.5 flex items-center gap-1 px-3 text-[11px] font-bold tracking-wider text-[var(--brand-accent)] uppercase">
-                <ShieldCheck className="h-3.5 w-3.5" />
-                内容与系统工作台
-              </div>
-              <div className="space-y-1">
-                {studioNavItems.map((item) => {
-                  const active = studioTab === item.id;
-                  return (
-                    <button
-                      key={item.id}
-                      onClick={() => {
-                        setStudioTab(item.id);
-                        setMobileNavOpen(false);
-                      }}
-                      className={`flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm font-semibold transition ${
-                        active ? "bg-[var(--brand-primary)] text-white shadow-xs" : "text-[var(--ink-secondary)] hover:bg-[var(--bg-subtle)]"
-                      }`}
-                    >
-                      {item.icon}
-                      <span>{item.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-        )}
+                    {item.badge}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
-      {/* 底部：管理员进入后台切换卡（前台） / 局域网状态摘要（后台） */}
+      {/* 底部：语音采集小贴士 + 服务器地址 */}
       <div className="mt-4 space-y-2">
-        {workspaceMode === "front" && isAdmin && (
-          <button
-            onClick={() => {
-              setWorkspaceMode("studio");
-              setMobileNavOpen(false);
-            }}
-            className="flex w-full items-center justify-between rounded-2xl border border-[var(--border-soft)] bg-[var(--bg-subtle)] p-3.5 text-left transition hover:border-[var(--brand-primary)]"
-          >
-            <div>
-              <div className="flex items-center gap-1.5 text-xs font-extrabold text-[var(--ink-primary)]">
-                <Wrench className="h-3.5 w-3.5 text-[var(--brand-primary)]" />
-                内容工坊与管理后台
-              </div>
-              <div className="mt-0.5 text-[11px] text-[var(--ink-muted)]">分类、填充内容、音箱与模型 →</div>
-            </div>
-          </button>
-        )}
+        <button
+          onClick={() => {
+            setVoiceDrawerOpen(true);
+            setMobileNavOpen(false);
+          }}
+          className="w-full rounded-2xl border border-[var(--brand-primary)]/30 bg-[var(--brand-green-soft)] p-3 text-left transition hover:border-[var(--brand-primary)]"
+        >
+          <div className="flex items-center gap-1.5 text-xs font-extrabold text-[var(--brand-primary)]">
+            <MessageSquareHeart className="h-3.5 w-3.5" /> 语音操控与采集
+          </div>
+          <div className="mt-1 text-[11px] leading-snug text-[var(--ink-secondary)]">
+            试试说：“帮我采集汪汪队第2季” 或 “播放汪汪队第2季第5集”
+          </div>
+        </button>
 
-        <div className="rounded-2xl border border-[var(--border-soft)] bg-[var(--bg-subtle)] px-3 py-2.5 text-[11px] text-[var(--ink-muted)]">
+        <div className="rounded-2xl border border-[var(--border-soft)] bg-[var(--bg-subtle)] px-3 py-2 text-[11px] text-[var(--ink-muted)]">
           <div className="flex items-center justify-between font-mono">
             <span>{dashboard?.lan_ip || "127.0.0.1"}:{dashboard?.server_port || 8090}</span>
-            <span className={dashboard?.llm_configured ? "text-emerald-700 font-semibold" : "text-amber-700"}>
-              {dashboard?.llm_configured ? "LLM 就绪" : "离线兜底"}
+            <span className={dashboard?.llm_configured ? "font-semibold text-emerald-700" : "text-amber-700"}>
+              {dashboard?.llm_configured ? "AI 就绪" : "本地规则"}
             </span>
           </div>
         </div>
@@ -523,7 +547,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[var(--bg-canvas)] text-[var(--ink-primary)]">
-      {/* 隐藏全局音频标签（浏览器直出播放） */}
+      {/* 全局隐藏音频播放标签（支持精确断点跳转 + 5秒自动保存进度） */}
       <audio
         ref={audioRef}
         onTimeUpdate={(e) => {
@@ -531,7 +555,7 @@ export default function App() {
           setProgressSec(t);
           const cur = queue[currentIndex];
           const now = Date.now();
-          if (cur && cur.kind === "track" && cur.id > 0 && now - lastProgressSyncRef.current > 5000) {
+          if (cur && cur.kind === "track" && cur.id > 0 && cur.parentId > 0 && now - lastProgressSyncRef.current > 5000) {
             lastProgressSyncRef.current = now;
             void api.saveProgress(cur.parentId, cur.id, t).catch(() => undefined);
           }
@@ -539,6 +563,10 @@ export default function App() {
         onLoadedMetadata={(e) => {
           const d = e.currentTarget.duration;
           if (Number.isFinite(d) && d > 0) setDurationSec(d);
+          if (pendingSeekRef.current > 1 && (!Number.isFinite(d) || pendingSeekRef.current < d - 1)) {
+            e.currentTarget.currentTime = pendingSeekRef.current;
+          }
+          pendingSeekRef.current = 0;
         }}
         onEnded={() => {
           if (loopMode === "repeat_one") {
@@ -550,7 +578,14 @@ export default function App() {
           }
         }}
         onPlay={() => setIsPlaying(true)}
-        onPause={() => setIsPlaying(false)}
+        onPause={() => {
+          setIsPlaying(false);
+          const cur = queue[currentIndex];
+          const t = audioRef.current?.currentTime || 0;
+          if (cur && cur.kind === "track" && cur.id > 0 && cur.parentId > 0 && t > 1) {
+            void api.saveProgress(cur.parentId, cur.id, t).catch(() => undefined);
+          }
+        }}
       />
 
       {/* 桌面端固定侧边栏 */}
@@ -586,15 +621,15 @@ export default function App() {
             </button>
             <div>
               <h1 className="text-base font-bold sm:text-lg">{currentHeaderTitle}</h1>
-              {dashboard && !dashboard.llm_configured && isAdmin && workspaceMode === "front" && (
+              {dashboard && !dashboard.llm_configured && isAdmin && (
                 <button
                   onClick={() => {
-                    setWorkspaceMode("studio");
-                    setStudioTab("system");
+                    setActiveTab("hub");
+                    setHubSubTab("system");
                   }}
                   className="text-[11px] font-medium text-amber-700 hover:underline"
                 >
-                  大模型 API Key 未配置（正使用本地兜底模式，点此前往管理后台配置）→
+                  大模型 API Key 未配置（当前使用本地智能分类与语音规则，点此配置大模型）→
                 </button>
               )}
             </div>
@@ -618,7 +653,7 @@ export default function App() {
 
             <button
               onClick={() => setVoiceDrawerOpen(true)}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--brand-green-soft)] px-3.5 py-1.5 text-xs font-semibold text-[var(--brand-green)] hover:bg-[var(--brand-primary-soft-hover)]"
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--brand-green-soft)] px-3.5 py-1.5 text-xs font-bold text-[var(--brand-primary)] hover:bg-[var(--brand-primary-soft-hover)]"
             >
               <MessageSquareHeart className="h-3.5 w-3.5" />
               喊「{dashboard?.assistant_name || "小音"}」控制
@@ -628,10 +663,10 @@ export default function App() {
               <span className="font-semibold">{user.display_name}</span>
               <span
                 className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
-                  isAdmin ? "bg-[var(--brand-green-soft)] text-[var(--brand-green)]" : "bg-zinc-100 text-zinc-600"
+                  isAdmin ? "bg-[var(--brand-green-soft)] text-[var(--brand-primary)]" : "bg-zinc-100 text-zinc-600"
                 }`}
               >
-                {isAdmin ? "管理员" : "家庭成员"}
+                {isAdmin ? "管理员" : "家人"}
               </span>
               <button
                 onClick={handleLogout}
@@ -644,103 +679,109 @@ export default function App() {
           </div>
         </header>
 
+        {/* 后台语音采集 + AI 自动分类实时完成通知横幅 */}
+        {collectBanner && (
+          <div className="mx-auto mt-3 w-full max-w-7xl px-4 sm:px-6">
+            <div
+              className={`flex flex-wrap items-center justify-between gap-3 rounded-2xl border px-4 py-3 text-xs shadow-sm ${
+                collectBanner.status === "done"
+                  ? "border-[var(--brand-primary)]/40 bg-[var(--brand-green-soft)] text-[var(--ink-primary)]"
+                  : "border-amber-300 bg-amber-50 text-amber-900"
+              }`}
+            >
+              <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                <Bell className="h-4 w-4 shrink-0 text-[var(--brand-primary)]" />
+                <div className="min-w-0">
+                  <div className="font-extrabold">
+                    {collectBanner.status === "done"
+                      ? `✨ 采集并 AI 分类完成：《${collectBanner.series_title}》${collectBanner.season_label}（+${collectBanner.tracks_added} 条）`
+                      : `采集任务结束：《${collectBanner.series_title}》`}
+                  </div>
+                  <div className="mt-0.5 truncate text-[11px] opacity-85">{collectBanner.summary_text}</div>
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                {collectBanner.tts_url && (
+                  <button
+                    onClick={() => playSingleUrl(collectBanner.tts_url!)}
+                    className="inline-flex items-center gap-1 rounded-xl border border-[var(--border-soft)] bg-white px-3 py-1.5 font-bold"
+                  >
+                    <Volume2 className="h-3.5 w-3.5" /> 听播报
+                  </button>
+                )}
+                {collectBanner.status === "done" && (
+                  <button
+                    onClick={() => {
+                      setActiveTab(collectBanner.channel);
+                      if (collectBanner.series_id) setFocusSeriesId(collectBanner.series_id);
+                      setCollectBanner(null);
+                    }}
+                    className="rounded-xl bg-[var(--brand-primary)] px-3.5 py-1.5 font-bold text-white"
+                  >
+                    去查看并播放 →
+                  </button>
+                )}
+                <button
+                  onClick={() => setCollectBanner(null)}
+                  className="rounded-lg p-1 opacity-60 hover:opacity-100"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <main className="mx-auto w-full max-w-7xl flex-1 p-4 sm:p-6">
           {!dashboard ? (
             <div className="card-pro p-10 text-center text-sm text-[var(--ink-muted)]">
               正在加载家庭声音中枢…
             </div>
-          ) : workspaceMode === "front" ? (
+          ) : (
             <>
-              {frontTab === "explore" && (
-                <ExplorePage
+              {(activeTab === "story" || activeTab === "music" || activeTab === "podcast") && (
+                <ChannelWorkspacePage
+                  channel={activeTab}
                   dashboard={dashboard}
-                  isAdmin={isAdmin}
-                  currentQueueItem={queue[currentIndex] || null}
-                  isPlaying={isPlaying}
+                  refreshSignal={refreshSignal}
+                  focusSeriesId={focusSeriesId}
+                  onClearFocusSeries={() => setFocusSeriesId(null)}
                   onPlayQueue={(items, idx) => void activateItemAt(items, idx)}
-                  onPlayUrl={playSingleUrl}
-                  onRefreshDashboard={fetchDashboard}
-                  onOpenStudioAlbum={(albumId) => {
-                    setWorkspaceMode("studio");
-                    if (albumId && albumId > 0) {
-                      setStudioTab("catalog");
-                      setStudioFocusAlbumId(albumId);
-                    } else {
-                      setStudioTab("ingest");
-                      setStudioFocusAlbumId(null);
-                    }
-                  }}
-                  onOpenCloudMusic={() => setFrontTab("cloud")}
-                  onOpenVoiceDrawer={() => setVoiceDrawerOpen(true)}
-                  showToast={showToast}
-                />
-              )}
-              {frontTab === "cloud" && (
-                <CloudMusicPage
-                  albums={dashboard.albums}
-                  onPlayQueue={(items, idx) => void activateItemAt(items, idx)}
-                  onRefreshDashboard={fetchDashboard}
-                  onGoExplore={() => setFrontTab("explore")}
-                  onOpenSettings={
-                    isAdmin
-                      ? () => {
-                          setWorkspaceMode("studio");
-                          setStudioTab("system");
-                        }
-                      : undefined
-                  }
-                  showToast={showToast}
-                />
-              )}
-              {frontTab === "rooms" && (
-                <RoomsControlPage
-                  dashboard={dashboard}
-                  isAdmin={isAdmin}
-                  onRefreshDashboard={fetchDashboard}
-                  onPlayUrl={playSingleUrl}
-                  onOpenStudioSystem={() => {
-                    setWorkspaceMode("studio");
-                    setStudioTab("system");
+                  onRefreshDashboard={() => {
+                    void fetchDashboard();
+                    setRefreshSignal((n) => n + 1);
                   }}
                   showToast={showToast}
                 />
               )}
-              {frontTab === "family" && (
-                <FamilyPage
+              {activeTab === "english" && (
+                <EnglishEnlightenmentPage
+                  dashboard={dashboard}
+                  refreshSignal={refreshSignal}
+                  onPlayQueue={(items, idx) => void activateItemAt(items, idx)}
                   onPlayUrl={playSingleUrl}
-                  onRefreshDashboard={fetchDashboard}
+                  onRefreshDashboard={() => {
+                    void fetchDashboard();
+                    setRefreshSignal((n) => n + 1);
+                  }}
+                  showToast={showToast}
+                />
+              )}
+              {activeTab === "hub" && (
+                <HubSettingsPage
+                  dashboard={dashboard}
+                  user={user}
+                  isAdmin={isAdmin}
+                  initialSubTab={hubSubTab}
+                  onRefreshDashboard={() => {
+                    void fetchDashboard();
+                    setRefreshSignal((n) => n + 1);
+                  }}
+                  onPlayUrl={playSingleUrl}
                   showToast={showToast}
                 />
               )}
             </>
-          ) : (
-            isAdmin && (
-              <>
-                {studioTab === "catalog" && (
-                  <StudioCatalogPage
-                    initialAlbumId={studioFocusAlbumId}
-                    onPlayQueue={(items, idx) => void activateItemAt(items, idx)}
-                    onRefreshDashboard={fetchDashboard}
-                    showToast={showToast}
-                  />
-                )}
-                {studioTab === "ingest" && (
-                  <StudioIngestPage
-                    onPlayQueue={(items, idx) => void activateItemAt(items, idx)}
-                    onRefreshDashboard={fetchDashboard}
-                    showToast={showToast}
-                  />
-                )}
-                {studioTab === "system" && (
-                  <StudioSystemPage
-                    dashboard={dashboard}
-                    currentUser={user}
-                    onRefreshDashboard={fetchDashboard}
-                    showToast={showToast}
-                  />
-                )}
-              </>
-            )
           )}
         </main>
       </div>
@@ -789,7 +830,10 @@ export default function App() {
         onPlayTrackItem={(item) => void activateItemAt([item], 0, "browser")}
         onPlayQueueItems={(items, idx) => void activateItemAt(items, idx, "browser")}
         onControlAction={handleVoiceControlAction}
-        onRefresh={fetchDashboard}
+        onRefresh={() => {
+          void fetchDashboard();
+          setRefreshSignal((n) => n + 1);
+        }}
         showToast={showToast}
       />
 

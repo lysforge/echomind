@@ -61,6 +61,8 @@ export interface MediaTrack {
   vocab?: Array<{ en: string; zh: string; example: string }>;
   objective?: string;
   completed?: number;
+  last_position_sec?: number;
+  last_played_at?: string | null;
   stream_url?: string;
   lufs_normalized: number;
   play_count: number;
@@ -69,6 +71,9 @@ export interface MediaTrack {
 
 export interface MediaAlbum {
   id: number;
+  series_id?: number | null;
+  season_num?: number;
+  season_label?: string;
   title: string;
   category: "music" | "story" | "english" | "podcast";
   sub_tag?: string;
@@ -86,6 +91,37 @@ export interface MediaAlbum {
   tracks?: MediaTrack[];
 }
 
+export interface SeriesResumeInfo {
+  album_id: number;
+  season_num: number;
+  season_label: string;
+  track_id: number;
+  track_title: string;
+  episode_num: number;
+  position_sec: number;
+  last_played_at: string | null;
+}
+
+export interface MediaSeries {
+  id: number;
+  title: string;
+  channel: "music" | "story" | "english" | "podcast";
+  level_code: string;
+  cover_emoji: string;
+  author: string;
+  description: string;
+  last_album_id: number | null;
+  last_track_id: number | null;
+  last_position_sec: number;
+  last_played_at: string | null;
+  created_at: string;
+  seasons: MediaAlbum[];
+  season_count: number;
+  total_tracks: number;
+  completed_tracks: number;
+  resume_info: SeriesResumeInfo | null;
+}
+
 export interface CategoryTag {
   id: number;
   channel: MediaAlbum["category"];
@@ -94,13 +130,17 @@ export interface CategoryTag {
 }
 
 export interface RoomPlaybackSession {
+  series_id?: number | null;
+  season_num?: number;
+  season_label?: string;
   album_id: number | null;
   album_title: string;
   status: "playing" | "paused" | "stopped";
   loop_mode: "sequential" | "repeat_one" | "shuffle";
   current_index: number;
-  current_track: { id: number; title: string; duration_sec: number; stream_url: string } | null;
-  queue: Array<{ id: number; title: string; duration_sec: number; stream_url: string }>;
+  start_position_sec?: number;
+  current_track: { id: number; title: string; episode_num?: number; duration_sec: number; stream_url: string } | null;
+  queue: Array<{ id: number; title: string; episode_num?: number; duration_sec: number; stream_url: string }>;
   sleep_remaining_sec: number | null;
   sleep_remaining_episodes: number | null;
 }
@@ -508,6 +548,12 @@ export const api = {
         title: string;
         album_id?: number;
         album_title?: string;
+        series_id?: number;
+        series_title?: string;
+        season_num?: number;
+        season_label?: string;
+        episode_num?: number;
+        start_position_sec?: number;
         duration_sec?: number;
         stream_url?: string;
         is_cached?: boolean;
@@ -519,6 +565,7 @@ export const api = {
         title: string;
         album_id?: number;
         album_title?: string;
+        episode_num?: number;
         duration_sec?: number;
         stream_url?: string;
       }>;
@@ -530,7 +577,21 @@ export const api = {
         episodes?: number;
         album_id?: number;
         start_index?: number;
+        index?: number;
+        episode_num?: number;
       };
+      background_job?: {
+        job_id: number;
+        status: string;
+        query: string;
+        preview?: {
+          channel: string;
+          series_title: string;
+          season_num: number;
+          season_label: string;
+          level_code: string;
+        };
+      } | null;
       track_url?: string | null;
     }>("/api/interact", {
       method: "POST",
@@ -619,6 +680,68 @@ export const api = {
       body: JSON.stringify({ device_id: deviceId }),
     }),
 
+  // Series -> Season -> Track 三级树 API
+  listSeries: (params?: { channel?: string; level_code?: string; q?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.channel) qs.set("channel", params.channel);
+    if (params?.level_code) qs.set("level_code", params.level_code);
+    if (params?.q) qs.set("q", params.q);
+    return req<MediaSeries[]>(`/api/media/series?${qs.toString()}`);
+  },
+  createSeries: (payload: {
+    title: string;
+    channel: MediaSeries["channel"];
+    level_code?: string;
+    cover_emoji?: string;
+    author?: string;
+    description?: string;
+    auto_create_first_season?: boolean;
+    first_season_label?: string;
+  }) =>
+    req<MediaSeries>("/api/media/series", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  updateSeries: (
+    id: number,
+    payload: Partial<Pick<MediaSeries, "title" | "channel" | "level_code" | "cover_emoji" | "author" | "description">>
+  ) =>
+    req<MediaSeries>(`/api/media/series/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  deleteSeries: (id: number) => req(`/api/media/series/${id}`, { method: "DELETE" }),
+  createSeason: (
+    seriesId: number,
+    payload: { season_num?: number; season_label?: string; title?: string; description?: string; play_mode?: "sequential" | "shuffle" }
+  ) =>
+    req<MediaAlbum>(`/api/media/series/${seriesId}/seasons`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  aiCollect: (payload: {
+    query: string;
+    channel_hint?: MediaSeries["channel"];
+    series_id?: number | null;
+    album_id?: number | null;
+    max_items?: number;
+    device_id?: string;
+    notify_speaker?: boolean;
+  }) =>
+    req<{
+      job_id: number;
+      status: string;
+      query: string;
+      preview?: { channel: string; series_title: string; season_num: number; season_label: string; level_code: string };
+    }>("/api/media/collect/ai-collect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+
   // Category Tags & Unified Media
   listTags: (channel?: string) => {
     const qs = new URLSearchParams();
@@ -674,9 +797,12 @@ export const api = {
   listPlaybackRooms: () => req<RoomPlaybackState[]>("/api/playback/rooms"),
   pushPlayback: (payload: {
     device_ids: string[];
+    series_id?: number;
     album_id?: number;
     track_ids?: number[];
     start_index?: number;
+    start_position_sec?: number;
+    resume?: boolean;
     loop_mode?: "sequential" | "repeat_one" | "shuffle";
     sleep_minutes?: number | null;
     sleep_episodes?: number | null;
@@ -839,6 +965,12 @@ export const api = {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ completed }),
+    }),
+  pronounceEnglish: (text: string, rate = "-8%", deviceId = "") =>
+    req<{ text: string; tts_url: string }>("/api/english/pronounce", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, rate, device_id: deviceId }),
     }),
   listEnglish: (stage?: string, q?: string) => {
     const qs = new URLSearchParams();
